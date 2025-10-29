@@ -6,6 +6,7 @@
 #include "lv_conf.h"
 #include "m5gfx_lvgl.hpp"
 #include <Preferences.h>
+#include "gauge_animation.h"
 
 Adafruit_MLX90614 mlx = Adafruit_MLX90614();
 
@@ -38,6 +39,7 @@ enum SettingsScreen {
     SETTINGS_MENU,
     SETTINGS_UNITS,
     SETTINGS_AUDIO,
+    SETTINGS_DISPLAY,
     SETTINGS_ALERTS,
     SETTINGS_EXIT
 };
@@ -95,14 +97,14 @@ lv_obj_t *temp_display_back_btn;
 lv_obj_t *object_temp_label;
 lv_obj_t *ambient_temp_label;
 lv_obj_t *temp_status_label;
-lv_obj_t *temp_unit_label;
+lv_obj_t *temp_circle;
 
-  // UI Objects - Temperature Gauge Screen
-  lv_obj_t *temp_gauge_screen;
-  lv_obj_t *temp_gauge_back_btn;
-  lv_obj_t *temp_scale;
-  lv_obj_t *temp_gauge_needle;
-  lv_obj_t *temp_gauge_value_label;
+// UI Objects - Temperature Gauge Screen
+lv_obj_t *temp_gauge_screen;
+lv_obj_t *temp_gauge_back_btn;
+lv_obj_t *temp_scale;
+lv_obj_t *temp_gauge_needle;
+lv_obj_t *temp_gauge_value_label;
 
 // UI Objects - Settings Screen
 lv_obj_t *settings_screen;
@@ -116,6 +118,12 @@ lv_obj_t *tab_alerts;
 // Exit tab selection buttons
 lv_obj_t *exit_cancel_btn;
 lv_obj_t *exit_save_btn;
+
+// Main Menu Temperature Preview
+lv_obj_t *temp_preview_label;
+
+// Temperature Display Screen - Unit Label
+lv_obj_t *temp_unit_label;
 
 // Settings widgets
 lv_obj_t *temp_unit_switch;
@@ -131,9 +139,6 @@ lv_obj_t *low_temp_label;
 lv_obj_t *high_temp_label;
 
 // Function declarations
-void IRAM_ATTR button1_ISR();
-void IRAM_ATTR button2_ISR();
-void IRAM_ATTR key_ISR();
 void setup_hardware();
 void load_preferences();
 void save_preferences();
@@ -148,6 +153,7 @@ void update_temp_display_screen();
 void update_temp_gauge_screen();
 void play_beep(int frequency, int duration);
 void check_temp_alerts();
+lv_color_t get_temperature_color(float temperature);
 
 // Event handlers
 void main_menu_event_cb(lv_event_t *e);
@@ -188,16 +194,18 @@ void switch_to_settings_screen() {
     switch (current_settings_screen) {
       case SETTINGS_MENU: {
         lv_label_set_text(title, "Configuration");
-        // Settings menu with category selection (2x2 grid layout)
-        const char *menu_items[] = {"Units", "Audio", "Alerts", "Exit"};
-        for (int i = 0; i < 4; i++) {
+        // Settings menu with category selection (2x3 grid layout for 5 items)
+        const char *menu_items[] = {"Units", "Audio", "Display", "Alerts", "Exit"};
+        for (int i = 0; i < 5; i++) {
           lv_obj_t *menu_btn = lv_btn_create(settings_screen);
-          lv_obj_set_size(menu_btn, 140, 60); // Wider buttons for 2x2 grid
-          // 2x2 grid positioning: Top row (y=-40), Bottom row (y=40)
-          // Left column (x=-80), Right column (x=80)
-          int row = i / 2; // 0 for top row, 1 for bottom row
-          int col = i % 2; // 0 for left column, 1 for right column
-          lv_obj_align(menu_btn, LV_ALIGN_CENTER, (col == 0 ? -80 : 80), (row == 0 ? -40 : 40));
+          lv_obj_set_size(menu_btn, 90, 50); // Smaller buttons for 2x3 grid
+
+          // 2x3 grid positioning: Top row (y=-35), Bottom row (y=35)
+          // Left column (x=-100), Center column (x=0), Right column (x=100)
+          int row = i / 3; // 0 for top row, 1 for bottom row
+          int col = i % 3; // 0 for left, 1 for center, 2 for right column
+          lv_obj_align(menu_btn, LV_ALIGN_CENTER, (col == 0 ? -100 : (col == 1 ? 0 : 100)), (row == 0 ? -35 : 35));
+
           lv_obj_set_style_bg_color(menu_btn, lv_color_hex(0x34495e), LV_PART_MAIN);
           lv_obj_set_style_border_width(menu_btn, 2, LV_PART_MAIN);
           lv_obj_set_style_border_color(menu_btn, lv_color_hex(0xFF6B35), LV_PART_MAIN);
@@ -207,7 +215,7 @@ void switch_to_settings_screen() {
 
           lv_obj_t *menu_label = lv_label_create(menu_btn);
           lv_label_set_text(menu_label, menu_items[i]);
-          lv_obj_set_style_text_font(menu_label, &lv_font_montserrat_16, 0);
+          lv_obj_set_style_text_font(menu_label, &lv_font_montserrat_14, 0);
           lv_obj_set_style_text_color(menu_label, lv_color_hex(0xFFFFFF), 0);
           lv_obj_center(menu_label);
         }
@@ -328,6 +336,51 @@ void switch_to_settings_screen() {
         break;
       }
 
+      case SETTINGS_DISPLAY: {
+        lv_label_set_text(title, "Display Settings");
+
+        // Brightness slider container
+        lv_obj_t *brightness_container = lv_obj_create(settings_screen);
+        lv_obj_set_size(brightness_container, 280, 80);
+        lv_obj_align(brightness_container, LV_ALIGN_CENTER, 0, -20);
+        lv_obj_set_style_bg_color(brightness_container, lv_color_hex(0x2c3e50), 0);
+        lv_obj_set_style_border_width(brightness_container, 2, 0);
+        lv_obj_set_style_border_color(brightness_container, lv_color_hex(0xFF6B35), 0);
+        lv_obj_set_style_radius(brightness_container, 10, 0);
+
+        // Brightness label
+        lv_obj_t *brightness_title = lv_label_create(brightness_container);
+        lv_label_set_text(brightness_title, "Screen Brightness");
+        lv_obj_set_style_text_font(brightness_title, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(brightness_title, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_align(brightness_title, LV_ALIGN_TOP_MID, 0, 8);
+
+        // Brightness slider
+        brightness_slider = lv_slider_create(brightness_container);
+        lv_obj_set_size(brightness_slider, 200, 20);
+        lv_obj_align(brightness_slider, LV_ALIGN_CENTER, 0, 10);
+        lv_slider_set_range(brightness_slider, 0, 255);
+        lv_slider_set_value(brightness_slider, brightness_level, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(brightness_slider, lv_color_hex(0x34495e), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(brightness_slider, lv_color_hex(0xFF6B35), LV_PART_INDICATOR);
+        lv_obj_add_event_cb(brightness_slider, brightness_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+        // Brightness value display
+        char brightness_str[10];
+        snprintf(brightness_str, sizeof(brightness_str), "%d", brightness_level);
+        brightness_label = lv_label_create(brightness_container);
+        lv_label_set_text(brightness_label, brightness_str);
+        lv_obj_set_style_text_font(brightness_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(brightness_label, lv_color_hex(0x00FF00), 0);
+        lv_obj_align(brightness_label, LV_ALIGN_CENTER, 0, 45);
+
+        lv_obj_t *instruction = lv_label_create(settings_screen);
+        lv_label_set_text(instruction, "Key: Return to Menu");
+        lv_obj_set_style_text_color(instruction, lv_color_hex(0xCCCCCC), 0);
+        lv_obj_align(instruction, LV_ALIGN_BOTTOM_MID, 0, -20);
+        break;
+      }
+
       case SETTINGS_EXIT: {
         lv_label_set_text(title, "Save & Exit");
         // Exit confirmation
@@ -405,14 +458,15 @@ void setup() {
   Serial.println("NCIR sensor initialized");
   
   // Test sensor reading
-  float test_obj = mlx.readObjectTempC();
-  float test_amb = mlx.readAmbientTempC();
+  float test_obj = mlx.readObjectTempF();
+  float test_amb = mlx.readAmbientTempF();
   Serial.printf("Sensor test - Object: %.1f°C, Ambient: %.1f°C\n", test_obj, test_amb);
 
   // Initialize LVGL
   Serial.println("Before LVGL init");
   lv_init();
   Serial.println("After LVGL init");
+  Serial.printf("LVGL %d.%d.%d\n", LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
   Serial.println("Before m5gfx_lvgl_init");
   m5gfx_lvgl_init();
   Serial.println("After m5gfx_lvgl_init");
@@ -448,12 +502,6 @@ void setup() {
   Serial.println("Multi-screen UI created");
   Serial.println("M5Stack CoreS3 NCIR UI Ready!");
 }
-
-// Touch input is handled automatically by LVGL event system
-// No additional touch handling needed - LVGL manages all touch events through button callbacks
-
-// Touch input is handled automatically by LVGL event system
-// No additional touch handling needed - LVGL manages all touch events through button callbacks
 
 void loop() {
   M5.update();
@@ -500,8 +548,8 @@ void loop() {
     if (current_button1_state == LOW && last_button1_state == HIGH && current_time - last_button_time[0] >= DEBOUNCE_DELAY) {
       Serial.println("Button 1 pressed (Settings navigation)");
       if (current_settings_screen == SETTINGS_MENU) {
-        // Navigate forward through menu items (0-3)
-        current_settings_selection = (current_settings_selection + 1) % 4;
+        // Navigate forward through menu items (0-4)
+        current_settings_selection = (current_settings_selection + 1) % 5;
         switch_to_settings_screen(); // Refresh UI to show new selection
       } else if (current_settings_screen == SETTINGS_UNITS) {
         // In units page, select Celsius
@@ -521,8 +569,8 @@ void loop() {
     if (current_button2_state == LOW && last_button2_state == HIGH && current_time - last_button_time[1] >= DEBOUNCE_DELAY) {
       Serial.println("Button 2 pressed (Settings navigation)");
       if (current_settings_screen == SETTINGS_MENU) {
-        // Navigate backward through menu items (0-3)
-        current_settings_selection = (current_settings_selection - 1 + 4) % 4;
+        // Navigate backward through menu items (0-4)
+        current_settings_selection = (current_settings_selection - 1 + 5) % 5;
         switch_to_settings_screen(); // Refresh UI to show new selection
       } else if (current_settings_screen == SETTINGS_UNITS) {
         // In units page, select Fahrenheit
@@ -547,8 +595,9 @@ void loop() {
         switch (current_settings_selection) {
           case 0: selected_screen = SETTINGS_UNITS; break;
           case 1: selected_screen = SETTINGS_AUDIO; break;
-          case 2: selected_screen = SETTINGS_ALERTS; break;
-          case 3: selected_screen = SETTINGS_EXIT; break;
+          case 2: selected_screen = SETTINGS_DISPLAY; break;
+          case 3: selected_screen = SETTINGS_ALERTS; break;
+          case 4: selected_screen = SETTINGS_EXIT; break;
         }
         current_settings_screen = selected_screen;
         switch_to_settings_screen(); // Show the selected settings page
@@ -561,6 +610,11 @@ void loop() {
         // Toggle sound alerts and return
         sound_enabled = !sound_enabled;
         Serial.printf("Sound alerts toggled to: %s - returning to main menu\n", sound_enabled ? "ON" : "OFF");
+        save_preferences();
+        switch_to_screen(SCREEN_MAIN_MENU); // Return to main menu
+      } else if (current_settings_screen == SETTINGS_DISPLAY) {
+        // Brightness is adjusted via slider, just return to main menu
+        Serial.printf("Brightness set to: %d - returning to main menu\n", brightness_level);
         save_preferences();
         switch_to_screen(SCREEN_MAIN_MENU); // Return to main menu
       } else if (current_settings_screen == SETTINGS_ALERTS) {
@@ -601,26 +655,23 @@ void loop() {
       update_temp_gauge_screen();
     }
 
+    // Update main menu temperature preview
+    if (current_screen == SCREEN_MAIN_MENU && temp_preview_label) {
+      char temp_str[64];
+      float display_obj_temp = use_celsius ? current_object_temp : (current_object_temp * 9.0/5.0 + 32.0);
+      float display_amb_temp = use_celsius ? current_ambient_temp : (current_ambient_temp * 9.0/5.0 + 32.0);
+      snprintf(temp_str, sizeof(temp_str), "Current: %.1f°%c | Ambient: %.1f°%c",
+              display_obj_temp, use_celsius ? 'C' : 'F',
+              display_amb_temp, use_celsius ? 'C' : 'F');
+      lv_label_set_text(temp_preview_label, temp_str);
+    }
+
     check_temp_alerts();
     last_update = millis();
   }
 
   // Small delay to prevent watchdog issues but allow button polling
   delay(10);
-}
-
-
-// Hardware interrupt service routines
-void IRAM_ATTR button1_ISR() {
-  button1_pressed = true;
-}
-
-void IRAM_ATTR button2_ISR() {
-  button2_pressed = true;
-}
-
-void IRAM_ATTR key_ISR() {
-  key_pressed = true;
 }
 
 // Setup hardware pins and button polling
@@ -698,169 +749,257 @@ void switch_to_screen(ScreenState new_screen) {
   }
 }
 
-// Create main menu screen with alternative orange/blue theme
+// Create main menu screen with improved layout and modern design
 void create_main_menu_ui() {
   main_menu_screen = lv_obj_create(NULL);
-  lv_obj_set_style_bg_color(main_menu_screen, lv_color_hex(0x1a1a40), 0); // Dark blue-purple background
+  lv_obj_set_style_bg_color(main_menu_screen, lv_color_hex(0x0f1419), 0); // Dark background
+  lv_obj_remove_flag(main_menu_screen, LV_OBJ_FLAG_SCROLLABLE);
 
-  // Title with custom styling
-  menu_title = lv_label_create(main_menu_screen);
+  // Modern header section with gradient effect - optimized height and positioning
+  lv_obj_t *header_bg = lv_obj_create(main_menu_screen);
+  lv_obj_set_size(header_bg, 320, 85);
+  lv_obj_align(header_bg, LV_ALIGN_TOP_MID, 0, 0); // Back to standard position to avoid cutoff
+  lv_obj_set_style_bg_color(header_bg, lv_color_hex(0x1a1a2e), 0);
+  lv_obj_remove_flag(header_bg, LV_OBJ_FLAG_SCROLLABLE); // Make header container non-scrollable
+
+  // Header accent line - adjusted position for optimized header height
+  lv_obj_t *header_accent = lv_obj_create(main_menu_screen);
+  lv_obj_set_size(header_accent, 320, 2);
+  lv_obj_align(header_accent, LV_ALIGN_TOP_MID, 0, 81); // Back to standard position
+  lv_obj_set_style_bg_color(header_accent, lv_color_hex(0xFF6B35), 0);
+
+  // Main title with enhanced typography - repositioned for better layout
+  menu_title = lv_label_create(header_bg);
   lv_label_set_text(menu_title, "NCIR Monitor");
   lv_obj_set_style_text_font(menu_title, &lv_font_montserrat_24, 0);
-  lv_obj_set_style_text_color(menu_title, lv_color_hex(0xFF6B35), 0); // Orange accent
-  lv_obj_align(menu_title, LV_ALIGN_TOP_MID, 0, 15);
+  lv_obj_set_style_text_color(menu_title, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_align(menu_title, LV_ALIGN_TOP_MID, 0, 8);
 
-  // Decorative underline
-  lv_obj_t *title_underline = lv_label_create(main_menu_screen);
-  lv_label_set_text(title_underline, "━━━━━━━━━━━━━━━━━━━━━━━━");
-  lv_obj_set_style_text_color(title_underline, lv_color_hex(0x4285F4), 0); // Blue accent
-  lv_obj_align(title_underline, LV_ALIGN_TOP_MID, 0, 45);
+  // Subtitle with device status - repositioned to ensure full visibility
+  lv_obj_t *subtitle = lv_label_create(header_bg);
+  lv_label_set_text(subtitle, "Non-Contact Temperature Monitor");
+  lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(subtitle, lv_color_hex(0xB0B0B0), 0);
+  lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 45);
 
-  // Temperature Display button with enhanced styling
+  // Ensure main screen is not scrollable
+  lv_obj_remove_flag(main_menu_screen, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Additional check to ensure no child objects are scrollable
+  lv_obj_remove_flag(header_bg, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Main action buttons in an improved horizontal layout - raised up with more spacing
+  int button_width = 90;
+  int button_height = 100;
+  int button_spacing = 10; // Increased spacing between buttons
+  int button_y_offset = 25; // Raise buttons up significantly
+
+  // Left: Temperature Display (Orange theme)
   temp_display_btn = lv_btn_create(main_menu_screen);
-  lv_obj_set_size(temp_display_btn, 200, 60);
-  lv_obj_align(temp_display_btn, LV_ALIGN_CENTER, 0, -55);
-  lv_obj_set_style_bg_color(temp_display_btn, lv_color_hex(0x2c3e50), LV_PART_MAIN); // Dark blue-gray
-  lv_obj_set_style_border_width(temp_display_btn, 2, LV_PART_MAIN);
-  lv_obj_set_style_border_color(temp_display_btn, lv_color_hex(0xFF6B35), LV_PART_MAIN); // Orange border
+  lv_obj_set_size(temp_display_btn, button_width, button_height);
+  lv_obj_align(temp_display_btn, LV_ALIGN_LEFT_MID, button_spacing, button_y_offset);
+  lv_obj_set_style_bg_color(temp_display_btn, lv_color_hex(0x2c3e50), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_color(temp_display_btn, lv_color_hex(0xFF6B35), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_dir(temp_display_btn, LV_GRAD_DIR_VER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(temp_display_btn, 4, LV_PART_MAIN);
+  lv_obj_set_style_border_color(temp_display_btn, lv_color_hex(0xFF6B35), LV_PART_MAIN);
+  lv_obj_set_style_radius(temp_display_btn, 15, 0);
+  lv_obj_set_style_shadow_width(temp_display_btn, 5, 0);
+  lv_obj_set_style_shadow_color(temp_display_btn, lv_color_hex(0xFF6B35), 0);
   lv_obj_add_event_cb(temp_display_btn, main_menu_event_cb, LV_EVENT_CLICKED, (void*)SCREEN_TEMP_DISPLAY);
 
+  lv_obj_t *temp_display_icon = lv_label_create(temp_display_btn);
+  lv_label_set_text(temp_display_icon, "🌡️");
+  lv_obj_set_style_text_font(temp_display_icon, &lv_font_montserrat_24, 0);
+  lv_obj_align(temp_display_icon, LV_ALIGN_TOP_MID, 0, 10);
+
   lv_obj_t *temp_display_label = lv_label_create(temp_display_btn);
-  lv_label_set_text(temp_display_label, "Temperature Display");
+  lv_label_set_text(temp_display_label, "Display");
   lv_obj_set_style_text_font(temp_display_label, &lv_font_montserrat_16, 0);
   lv_obj_set_style_text_color(temp_display_label, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_center(temp_display_label);
+  lv_obj_align(temp_display_label, LV_ALIGN_BOTTOM_MID, 0, -10);
 
-  // Temperature Gauge button with enhanced styling
+  // Center: Temperature Gauge (Blue theme)
   temp_gauge_btn = lv_btn_create(main_menu_screen);
-  lv_obj_set_size(temp_gauge_btn, 200, 60);
-  lv_obj_align(temp_gauge_btn, LV_ALIGN_CENTER, 0, 10);
-  lv_obj_set_style_bg_color(temp_gauge_btn, lv_color_hex(0x2c3e50), LV_PART_MAIN); // Dark blue-gray
-  lv_obj_set_style_border_width(temp_gauge_btn, 2, LV_PART_MAIN);
-  lv_obj_set_style_border_color(temp_gauge_btn, lv_color_hex(0x4285F4), LV_PART_MAIN); // Blue border
+  lv_obj_set_size(temp_gauge_btn, button_width, button_height);
+  lv_obj_align(temp_gauge_btn, LV_ALIGN_CENTER, 0, button_y_offset);
+  lv_obj_set_style_bg_color(temp_gauge_btn, lv_color_hex(0x2c3e50), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_color(temp_gauge_btn, lv_color_hex(0x4285F4), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_dir(temp_gauge_btn, LV_GRAD_DIR_VER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(temp_gauge_btn, 4, LV_PART_MAIN);
+  lv_obj_set_style_border_color(temp_gauge_btn, lv_color_hex(0x4285F4), LV_PART_MAIN);
+  lv_obj_set_style_radius(temp_gauge_btn, 15, 0);
+  lv_obj_set_style_shadow_width(temp_gauge_btn, 5, 0);
+  lv_obj_set_style_shadow_color(temp_gauge_btn, lv_color_hex(0x4285F4), 0);
   lv_obj_add_event_cb(temp_gauge_btn, main_menu_event_cb, LV_EVENT_CLICKED, (void*)SCREEN_TEMP_GAUGE);
 
+  // Create gauge animation using LVGL example pattern
+  lv_obj_t *gauge_lottie = lv_lottie_create(temp_gauge_btn);
+  
+  // Load gauge animation from embedded data (following LVGL example pattern)
+  lv_lottie_set_src_data(gauge_lottie, gauge_animation, gauge_animation_size);
+  
+  // Set up buffer following LVGL example
+#if LV_DRAW_BUF_ALIGN == 4 && LV_DRAW_BUF_STRIDE_ALIGN == 1
+  /*If there are no special requirements, just declare a buffer
+    x4 because the Lottie is rendered in ARGB8888_PREMULTIPLIED format*/
+  static uint8_t buf[80 * 50 * 4];
+  lv_lottie_set_buffer(gauge_lottie, 80, 50, buf);
+#else
+  /*For GPUs and special alignment/stride setting use a draw_buf instead*/
+  LV_DRAW_BUF_DEFINE_STATIC(draw_buf, 80, 50, LV_COLOR_FORMAT_ARGB8888_PREMULTIPLIED);
+  lv_lottie_set_draw_buf(gauge_lottie, &draw_buf);
+#endif
+
+  lv_obj_center(gauge_lottie);
+
   lv_obj_t *temp_gauge_label = lv_label_create(temp_gauge_btn);
-  lv_label_set_text(temp_gauge_label, "Temperature Gauge");
+  lv_label_set_text(temp_gauge_label, "Gauge");
   lv_obj_set_style_text_font(temp_gauge_label, &lv_font_montserrat_16, 0);
   lv_obj_set_style_text_color(temp_gauge_label, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_center(temp_gauge_label);
+  lv_obj_align(temp_gauge_label, LV_ALIGN_BOTTOM_MID, 0, -10);
 
-  // Settings button
+  // Right: Settings (Purple theme)
   settings_menu_btn = lv_btn_create(main_menu_screen);
-  lv_obj_set_size(settings_menu_btn, 200, 60);
-  lv_obj_align(settings_menu_btn, LV_ALIGN_BOTTOM_MID, 0, -25);
-  lv_obj_set_style_bg_color(settings_menu_btn, lv_color_hex(0x34495e), LV_PART_MAIN); // Dark gray-blue
-  lv_obj_set_style_border_width(settings_menu_btn, 2, LV_PART_MAIN);
-  lv_obj_set_style_border_color(settings_menu_btn, lv_color_hex(0x9b59b6), LV_PART_MAIN); // Purple border
+  lv_obj_set_size(settings_menu_btn, button_width, button_height);
+  lv_obj_align(settings_menu_btn, LV_ALIGN_RIGHT_MID, -button_spacing, button_y_offset);
+  lv_obj_set_style_bg_color(settings_menu_btn, lv_color_hex(0x2c3e50), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_color(settings_menu_btn, lv_color_hex(0x9b59b6), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_dir(settings_menu_btn, LV_GRAD_DIR_VER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(settings_menu_btn, 4, LV_PART_MAIN);
+  lv_obj_set_style_border_color(settings_menu_btn, lv_color_hex(0x9b59b6), LV_PART_MAIN);
+  lv_obj_set_style_radius(settings_menu_btn, 15, 0);
+  lv_obj_set_style_shadow_width(settings_menu_btn, 5, 0);
+  lv_obj_set_style_shadow_color(settings_menu_btn, lv_color_hex(0x9b59b6), 0);
   lv_obj_add_event_cb(settings_menu_btn, main_menu_event_cb, LV_EVENT_CLICKED, (void*)SCREEN_SETTINGS);
+
+  lv_obj_t *settings_icon = lv_label_create(settings_menu_btn);
+  lv_label_set_text(settings_icon, "⚙️");
+  lv_obj_set_style_text_font(settings_icon, &lv_font_montserrat_24, 0);
+  lv_obj_align(settings_icon, LV_ALIGN_TOP_MID, 0, 10);
 
   lv_obj_t *settings_label = lv_label_create(settings_menu_btn);
   lv_label_set_text(settings_label, "Settings");
   lv_obj_set_style_text_font(settings_label, &lv_font_montserrat_16, 0);
   lv_obj_set_style_text_color(settings_label, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_center(settings_label);
-
-  // Hardware control indicators with modern styling
-  lv_obj_t *btn1_indicator = lv_label_create(main_menu_screen);
-  lv_label_set_text(btn1_indicator, "Btn1: ---");
-  lv_obj_set_style_text_color(btn1_indicator, lv_color_hex(0x99aab5), 0);
-  lv_obj_set_style_text_font(btn1_indicator, &lv_font_montserrat_12, 0);
-  lv_obj_align(btn1_indicator, LV_ALIGN_BOTTOM_LEFT, 10, -8);
-
-  lv_obj_t *btn2_indicator = lv_label_create(main_menu_screen);
-  lv_label_set_text(btn2_indicator, "Btn2: ---");
-  lv_obj_set_style_text_color(btn2_indicator, lv_color_hex(0x99aab5), 0);
-  lv_obj_set_style_text_font(btn2_indicator, &lv_font_montserrat_12, 0);
-  lv_obj_align(btn2_indicator, LV_ALIGN_BOTTOM_MID, 0, -8);
-
-  lv_obj_t *key_indicator = lv_label_create(main_menu_screen);
-  lv_label_set_text(key_indicator, "Key: Settings");
-  lv_obj_set_style_text_color(key_indicator, lv_color_hex(0xFF6B35), 0); // Orange highlight
-  lv_obj_set_style_text_font(key_indicator, &lv_font_montserrat_12, 0);
-  lv_obj_align(key_indicator, LV_ALIGN_BOTTOM_RIGHT, -10, -8);
+  lv_obj_align(settings_label, LV_ALIGN_BOTTOM_MID, 0, -10);
+  
+  // Remove bottom status bar and temperature preview on main menu
+  temp_preview_label = NULL;
 }
 
-// Create alternative temperature display screen with modern orange/blue theme
+// Create modern mobile app-style temperature display screen
 void create_temp_display_ui() {
   temp_display_screen = lv_obj_create(NULL);
-  lv_obj_set_style_bg_color(temp_display_screen, lv_color_hex(0x0f1419), 0); // Dark blue-gray background
+  lv_obj_set_style_bg_color(temp_display_screen, lv_color_hex(0xf5f5f5), 0); // Light gray background
+  lv_obj_remove_flag(temp_display_screen, LV_OBJ_FLAG_SCROLLABLE);
 
-  // Decorative header with temperature icon
-  lv_obj_t *header_bg = lv_obj_create(temp_display_screen);
-  lv_obj_set_size(header_bg, 320, 50);
-  lv_obj_align(header_bg, LV_ALIGN_TOP_MID, 0, 0);
-  lv_obj_set_style_bg_color(header_bg, lv_color_hex(0x1a2530), 0); // Darker blue header
+  // Header matching main menu style
+  lv_obj_t *header = lv_obj_create(temp_display_screen);
+  lv_obj_set_size(header, 320, 80);
+  lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_set_style_bg_color(header, lv_color_hex(0x1a1a2e), 0); // Match main menu header
+  lv_obj_set_style_border_width(header, 0, 0);
+  lv_obj_set_style_radius(header, 0, 0);
 
-  lv_obj_t *header_border = lv_obj_create(temp_display_screen);
-  lv_obj_set_size(header_border, 320, 2);
-  lv_obj_align(header_border, LV_ALIGN_TOP_MID, 0, 48);
-  lv_obj_set_style_bg_color(header_border, lv_color_hex(0xFF6B35), 0); // Orange accent line
+  // Header accent line matching main menu
+  lv_obj_t *header_accent = lv_obj_create(temp_display_screen);
+  lv_obj_set_size(header_accent, 320, 2);
+  lv_obj_align(header_accent, LV_ALIGN_TOP_MID, 0, 78);
+  lv_obj_set_style_bg_color(header_accent, lv_color_hex(0xFF6B35), 0); // Orange accent
 
-  lv_obj_t *title = lv_label_create(header_bg);
-  lv_label_set_text(title, "Temperature Reading");
-  lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
-  lv_obj_align(title, LV_ALIGN_CENTER, 10, 0);
+  // Header title with modern typography
+  lv_obj_t *header_title = lv_label_create(header);
+  lv_label_set_text(header_title, "Temperature");
+  lv_obj_set_style_text_color(header_title, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_text_font(header_title, &lv_font_montserrat_20, 0);
+  lv_obj_align(header_title, LV_ALIGN_TOP_MID, 0, 15);
 
-  // Main temperature display - large, prominent
-  lv_obj_t *temp_container = lv_obj_create(temp_display_screen);
-  lv_obj_set_size(temp_container, 260, 120);
-  lv_obj_align(temp_container, LV_ALIGN_CENTER, 0, -20);
-  lv_obj_set_style_bg_color(temp_container, lv_color_hex(0x1e2936), 0); // Medium blue background
-  lv_obj_set_style_border_width(temp_container, 3, 0);
-  lv_obj_set_style_border_color(temp_container, lv_color_hex(0x4285F4), 0); // Blue border
-  lv_obj_set_style_radius(temp_container, 15, 0);
+  // Subtitle matching main menu style
+  lv_obj_t *header_subtitle = lv_label_create(header);
+  lv_label_set_text(header_subtitle, "Real-time monitoring");
+  lv_obj_set_style_text_color(header_subtitle, lv_color_hex(0xB0B0B0), 0); // Match main menu subtitle
+  lv_obj_set_style_text_font(header_subtitle, &lv_font_montserrat_12, 0);
+  lv_obj_align(header_subtitle, LV_ALIGN_TOP_MID, 0, 45);
 
-  // Object temperature (primary reading)
-  object_temp_label = lv_label_create(temp_container);
-  lv_label_set_text(object_temp_label, "Object: --C");
-  lv_obj_set_style_text_color(object_temp_label, lv_color_hex(0xFF6B35), 0); // Orange text for object temp
+  // Main temperature display - enhanced circular style
+  temp_circle = lv_obj_create(temp_display_screen);
+  lv_obj_set_size(temp_circle, 180, 180);
+  lv_obj_align(temp_circle, LV_ALIGN_CENTER, 0, -5);
+  lv_obj_set_style_bg_color(temp_circle, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_border_width(temp_circle, 6, 0);
+  lv_obj_set_style_border_color(temp_circle, lv_color_hex(0xFF6B35), 0); // Match main menu orange
+  lv_obj_set_style_radius(temp_circle, 90, 0); // Perfect circle
+  lv_obj_set_style_shadow_width(temp_circle, 20, 0);
+  lv_obj_set_style_shadow_color(temp_circle, lv_color_hex(0x30000000), 0);
+
+  // Large temperature reading - bigger and bolder
+  object_temp_label = lv_label_create(temp_circle);
+  lv_label_set_text(object_temp_label, "--°");
+  lv_obj_set_style_text_color(object_temp_label, lv_color_hex(0xFF6B35), 0); // Match main menu orange
   lv_obj_set_style_text_font(object_temp_label, &lv_font_montserrat_24, 0);
   lv_obj_align(object_temp_label, LV_ALIGN_CENTER, 0, -15);
 
-  // Ambient temperature (secondary reading)
-  ambient_temp_label = lv_label_create(temp_container);
+  // Temperature unit - dynamic based on user preference
+  temp_unit_label = lv_label_create(temp_circle);
+  lv_label_set_text(temp_unit_label, use_celsius ? "Celsius" : "Fahrenheit");
+  lv_obj_set_style_text_color(temp_unit_label, lv_color_hex(0x9E9E9E), 0);
+  lv_obj_set_style_text_font(temp_unit_label, &lv_font_montserrat_14, 0);
+  lv_obj_align(temp_unit_label, LV_ALIGN_CENTER, 0, 20);
+
+  // Ambient temperature - enhanced card style
+  lv_obj_t *ambient_card = lv_obj_create(temp_display_screen);
+  lv_obj_set_size(ambient_card, 280, 70);
+  lv_obj_align(ambient_card, LV_ALIGN_CENTER, 0, 95);
+  lv_obj_set_style_bg_color(ambient_card, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_border_width(ambient_card, 0, 0);
+  lv_obj_set_style_radius(ambient_card, 16, 0);
+  lv_obj_set_style_shadow_width(ambient_card, 12, 0);
+  lv_obj_set_style_shadow_color(ambient_card, lv_color_hex(0x15000000), 0);
+
+  // Ambient icon - larger and more prominent
+  lv_obj_t *ambient_icon = lv_label_create(ambient_card);
+  lv_label_set_text(ambient_icon, "");
+  lv_obj_set_style_text_font(ambient_icon, &lv_font_montserrat_20, 0);
+  lv_obj_align(ambient_icon, LV_ALIGN_LEFT_MID, 20, 0);
+
+  // Ambient temperature text - better typography
+  ambient_temp_label = lv_label_create(ambient_card);
   lv_label_set_text(ambient_temp_label, "Ambient: --C");
-  lv_obj_set_style_text_color(ambient_temp_label, lv_color_hex(0x99AAB5), 0); // Light gray for ambient
-  lv_obj_set_style_text_font(ambient_temp_label, &lv_font_montserrat_16, 0);
-  lv_obj_align(ambient_temp_label, LV_ALIGN_CENTER, 0, 20);
+  lv_obj_set_style_text_color(ambient_temp_label, lv_color_hex(0x424242), 0);
+  lv_obj_set_style_text_font(ambient_temp_label, &lv_font_montserrat_18, 0);
+  lv_obj_align(ambient_temp_label, LV_ALIGN_LEFT_MID, 55, 0);
 
-  // Status indicator with modern styling
-  lv_obj_t *status_container = lv_obj_create(temp_display_screen);
-  lv_obj_set_size(status_container, 200, 40);
-  lv_obj_align(status_container, LV_ALIGN_CENTER, 0, 70);
-  lv_obj_set_style_bg_color(status_container, lv_color_hex(0x2c3e50), 0);
-  lv_obj_set_style_border_width(status_container, 2, 0);
-  lv_obj_set_style_border_color(status_container, lv_color_hex(0x9b59b6), 0); // Purple border
-  lv_obj_set_style_radius(status_container, 10, 0);
+  // Status indicator - modern pill style
+  lv_obj_t *status_pill = lv_obj_create(temp_display_screen);
+  lv_obj_set_size(status_pill, 120, 30);
+  lv_obj_align(status_pill, LV_ALIGN_CENTER, 0, 180);
+  lv_obj_set_style_bg_color(status_pill, lv_color_hex(0x4CAF50), 0); // Green
+  lv_obj_set_style_border_width(status_pill, 0, 0);
+  lv_obj_set_style_radius(status_pill, 15, 0);
 
-  temp_status_label = lv_label_create(status_container);
-  lv_label_set_text(temp_status_label, "Status: Ready");
-  lv_obj_set_style_text_color(temp_status_label, lv_color_hex(0x00FF00), 0);
-  lv_obj_set_style_text_font(temp_status_label, &lv_font_montserrat_14, 0);
+  temp_status_label = lv_label_create(status_pill);
+  lv_label_set_text(temp_status_label, "● Ready");
+  lv_obj_set_style_text_color(temp_status_label, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_text_font(temp_status_label, &lv_font_montserrat_12, 0);
   lv_obj_center(temp_status_label);
 
-  // Enhanced back button
+  // Modern floating action button matching main menu colors
   temp_display_back_btn = lv_btn_create(temp_display_screen);
-  lv_obj_set_size(temp_display_back_btn, 90, 45);
-  lv_obj_align(temp_display_back_btn, LV_ALIGN_BOTTOM_LEFT, 15, -15);
-  lv_obj_set_style_bg_color(temp_display_back_btn, lv_color_hex(0x34495e), LV_PART_MAIN);
-  lv_obj_set_style_border_width(temp_display_back_btn, 2, LV_PART_MAIN);
-  lv_obj_set_style_border_color(temp_display_back_btn, lv_color_hex(0xFF6B35), LV_PART_MAIN);
+  lv_obj_set_size(temp_display_back_btn, 60, 60);
+  lv_obj_align(temp_display_back_btn, LV_ALIGN_BOTTOM_RIGHT, -20, -20);
+  lv_obj_set_style_bg_color(temp_display_back_btn, lv_color_hex(0xFF6B35), LV_PART_MAIN); // Match main menu orange
+  lv_obj_set_style_border_width(temp_display_back_btn, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(temp_display_back_btn, 30, 0); // Perfect circle
+  lv_obj_set_style_shadow_width(temp_display_back_btn, 10, 0);
+  lv_obj_set_style_shadow_color(temp_display_back_btn, lv_color_hex(0x20000000), 0);
   lv_obj_add_event_cb(temp_display_back_btn, temp_display_back_event_cb, LV_EVENT_CLICKED, NULL);
 
-  lv_obj_t *back_label = lv_label_create(temp_display_back_btn);
-  lv_label_set_text(back_label, "Back");
-  lv_obj_set_style_text_font(back_label, &lv_font_montserrat_14, 0);
-  lv_obj_center(back_label);
-
-  // Hardware control indicator for this screen
-  lv_obj_t *control_indicator = lv_label_create(temp_display_screen);
-  lv_label_set_text(control_indicator, "Btn1: ---     Btn2: Menu     Key: ---");
-  lv_obj_set_style_text_color(control_indicator, lv_color_hex(0x607D8B), 0);
-  lv_obj_set_style_text_font(control_indicator, &lv_font_montserrat_12, 0);
-  lv_obj_align(control_indicator, LV_ALIGN_BOTTOM_MID, 0, -10);
+  lv_obj_t *back_icon = lv_label_create(temp_display_back_btn);
+  lv_label_set_text(back_icon, "←");
+  lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(back_icon, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_center(back_icon);
 }
 
 // Create modernized temperature gauge screen with alternative orange/blue theme
@@ -1000,15 +1139,51 @@ void update_temp_display_screen() {
     display_amb_temp = mlx.readAmbientTempF();  // Read Fahrenheit directly from sensor
   }
 
-  // Update labels with whole number temperatures
+  // Update circular temperature display border color based on temperature ranges
+  if (temp_circle) {
+    // Convert temperature to Fahrenheit for color ranges (ranges are in °F)
+    float temp_for_color;
+    if (use_celsius) {
+      // Convert Celsius to Fahrenheit for color calculation
+      temp_for_color = (display_obj_temp * 9.0/5.0) + 32.0;
+    } else {
+      // Already in Fahrenheit
+      temp_for_color = display_obj_temp;
+    }
+    
+    // Use a default temperature if the reading is invalid or 0
+    if (temp_for_color <= 0) {
+      temp_for_color = 77.0; // Default to 77°F (25°C) if no reading
+    }
+    
+    lv_color_t temp_color = get_temperature_color(temp_for_color);
+    
+    // Update the outer ring border color
+    lv_obj_set_style_border_color(temp_circle, temp_color, LV_PART_MAIN);
+    
+    // Also update the temperature text color to match
+    lv_obj_set_style_text_color(object_temp_label, temp_color, 0);
+    
+    // Debug output
+    Serial.printf("Temperature Display: %.1f°C (%.1f°F), Color applied\n", display_obj_temp, temp_for_color);
+  }
+
+  // Update main temperature display - mobile app style
   char temp_str[32];
-  snprintf(temp_str, sizeof(temp_str), "Object: %.0f%c", display_obj_temp, use_celsius ? 'C' : 'F');
+  snprintf(temp_str, sizeof(temp_str), "%.0f°", display_obj_temp);
   lv_label_set_text(object_temp_label, temp_str);
 
-  snprintf(temp_str, sizeof(temp_str), "Ambient: %.0f%c", display_amb_temp, use_celsius ? 'C' : 'F');
+  // Update ambient temperature
+  snprintf(temp_str, sizeof(temp_str), "Ambient: %.0f°%c", display_amb_temp, use_celsius ? 'C' : 'F');
   lv_label_set_text(ambient_temp_label, temp_str);
 
-  lv_label_set_text(temp_status_label, "Status: Active");
+  // Update unit label dynamically
+  if (temp_unit_label) {
+    lv_label_set_text(temp_unit_label, use_celsius ? "Celsius" : "Fahrenheit");
+  }
+
+  // Update status indicator
+  lv_label_set_text(temp_status_label, "● Active");
 }
 
 // Update temperature gauge screen
@@ -1023,6 +1198,7 @@ void update_temp_gauge_screen() {
   } else {
     display_temp = mlx.readObjectTempF();   // Read Fahrenheit directly from sensor
   }
+
 
   // Update needle position for the gauge
   if (temp_gauge_needle) {
@@ -1064,6 +1240,26 @@ void play_beep(int frequency, int duration) {
 
   // Use M5 Speaker instead of raw PWM
   M5.Speaker.tone(frequency, duration, 0, true);
+}
+
+// Get color based on temperature ranges
+// Temperature ranges: <480°F = Snowy Blue, 480-560°F = Lava Yellow, 561-620°F = Green, >620°F = Lava Red
+lv_color_t get_temperature_color(float temperature) {
+  Serial.printf("get_temperature_color: %.1f°F\n", temperature);
+  
+  if (temperature < 480) {
+    Serial.println("Color: Snowy Blue");
+    return lv_color_hex(0x87CEEB); // Snowy blue
+  } else if (temperature >= 480 && temperature <= 560) {
+    Serial.println("Color: Lava Yellow");
+    return lv_color_hex(0xFFA500); // Lava yellow
+  } else if (temperature >= 561 && temperature <= 620) {
+    Serial.println("Color: Green");
+    return lv_color_hex(0x00FF00); // Green
+  } else {
+    Serial.println("Color: Lava Red");
+    return lv_color_hex(0xFF4500); // Lava red
+  }
 }
 
 // Check for temperature alerts
@@ -1144,11 +1340,12 @@ void brightness_slider_event_cb(lv_event_t *e) {
   lv_obj_t *slider = (lv_obj_t*)lv_event_get_target(e);
   brightness_level = lv_slider_get_value(slider);
 
-  // Update brightness value label
-  lv_obj_t *brightness_value_label = lv_obj_get_child(slider, 0); // Assuming it's the next sibling
-  char brightness_str[10];
-  snprintf(brightness_str, sizeof(brightness_str), "%d", brightness_level);
-  lv_label_set_text(brightness_value_label, brightness_str);
+  // Update brightness value label (global brightness_label is created in switch_to_settings_screen)
+  if (brightness_label) {
+    char brightness_str[10];
+    snprintf(brightness_str, sizeof(brightness_str), "%d", brightness_level);
+    lv_label_set_text(brightness_label, brightness_str);
+  }
 
   // TODO: Apply brightness to display if supported
   save_preferences();
