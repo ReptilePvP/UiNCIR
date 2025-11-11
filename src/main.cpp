@@ -19,6 +19,10 @@ Adafruit_MLX90614 mlx = Adafruit_MLX90614();
 #define BUTTON2_PIN 18
 #define KEY_PIN      8
 
+/* ------------------- Audio config ------------------- */
+#define VOLUME_MIN  64
+#define VOLUME_MAX  255
+
 /* ------------------- Screen config ------------------- */
 #define SCREEN_WIDTH  320
 #define SCREEN_HEIGHT 240
@@ -47,8 +51,7 @@ enum SettingsScreen {
 int  brightness_level = 128;      // 0-255
 bool sound_enabled    = true;
 int  sound_volume     = 70;       // 0-100
-float low_temp_threshold  = 10.0f;
-float high_temp_threshold = 40.0f;
+float alert_temp_threshold = 600.0f;  // Default 600°F, adjustable 400-700°F
 bool alerts_enabled   = true;
 bool use_celsius      = true;
 int  update_rate      = 150;      // ms (faster updates for responsive readings)
@@ -56,6 +59,15 @@ bool debug_logging    = false;    // Enable/disable debug logging
 bool alerts_changed_by_user = false;  // Track if user manually changed alerts
 int main_menu_selection = 0;           // 0 = Thermometer, 1 = Gauge, 2 = Settings
 uint32_t last_main_menu_button_time[3] = {0, 0, 0};  // debounce
+
+/* ------------------- Battery monitoring ------------------- */
+int  battery_level     = 100;     // 0-100 percentage
+float battery_voltage  = 4.2f;    // Battery voltage
+bool battery_alerts_enabled = true;  // Enable battery low alerts
+int  battery_low_threshold = 20;     // Low battery alert threshold (%)
+int  battery_critical_threshold = 10; // Critical battery threshold (%)
+uint32_t last_battery_update = 0;     // Last battery reading time
+static const uint32_t battery_update_interval = 30000; // Update every 30 seconds
 
 
 /* ------------------- Temperature vars ------------------- */
@@ -111,9 +123,12 @@ void update_scale_config();
 void update_temperature_reading();
 void update_temp_display_screen();
 void update_temp_gauge_screen();
+void update_battery_reading();
+void check_battery_alerts();
 void play_beep(int freq, int dur);
 void check_temp_alerts();
 lv_color_t get_temperature_color(float tempF);
+lv_color_t get_battery_color(int level);
 void update_main_menu_highlight();
 
 
@@ -124,6 +139,8 @@ void temp_gauge_back_event_cb(lv_event_t *e);
 void brightness_slider_event_cb(lv_event_t *e);
 void volume_slider_event_cb(lv_event_t *e);
 void temp_alert_slider_event_cb(lv_event_t *e);
+void temp_alert_up_btn_event_cb(lv_event_t *e);
+void temp_alert_down_btn_event_cb(lv_event_t *e);
 
 /* ------------------- LVGL tick task ------------------- */
 static void lvgl_tick_task(void *) {
@@ -170,7 +187,6 @@ void setup() {
     Serial.println("UI ready");
 }
 
-
 /* ============================================================= */
 /* =========================== LOOP ============================ */
 /* ============================================================= */
@@ -190,16 +206,19 @@ void loop() {
       update_temperature_reading();
       if (current_screen == SCREEN_TEMP_DISPLAY) update_temp_display_screen();
       if (current_screen == SCREEN_TEMP_GAUGE)   update_temp_gauge_screen();
-      // Only check alerts if debug is on OR if user changed alerts
-      if (debug_logging || alerts_changed_by_user) {
+      // Only check alerts if debug is OFF (to avoid spam) OR if user changed alerts
+      if (!debug_logging || alerts_changed_by_user) {
           check_temp_alerts();
-          // Reset flag after use - ongoing checks will be handled by debug state
+          // Reset flag after use
           if (alerts_changed_by_user) {
               alerts_changed_by_user = false;
           }
       }
       last_update = millis();
   }
+
+  /* ---- Battery update ---- */
+  update_battery_reading();
 
   /* ---- Main Menu & Settings navigation (shared buttons) ---- */
   if (current_screen == SCREEN_MAIN_MENU || current_screen == SCREEN_SETTINGS) {
@@ -215,6 +234,7 @@ void loop() {
       /* ---- Button 1 (Up / Left) ---- */
       if (b1 == LOW && b1_last == HIGH && now - debounce[0] >= 150) {
           DEBUG_LOG("Button 1 pressed (screen %d)", current_screen);
+          play_beep(1000, 50);  // Short beep for button feedback
           if (current_screen == SCREEN_MAIN_MENU) {
               main_menu_selection = (main_menu_selection - 1 + 3) % 3;
               update_main_menu_highlight();
@@ -259,6 +279,7 @@ void loop() {
       /* ---- Button 2 (Down / Right) ---- */
       if (b2 == LOW && b2_last == HIGH && now - debounce[1] >= 150) {
           DEBUG_LOG("Button 2 pressed (screen %d)", current_screen);
+          play_beep(1200, 50);  // Short beep for button feedback
           if (current_screen == SCREEN_MAIN_MENU) {
               main_menu_selection = (main_menu_selection + 1) % 3;
               update_main_menu_highlight();
@@ -303,6 +324,7 @@ void loop() {
       /* ---- Key (Select / Confirm) ---- */
       if (key == LOW && key_last == HIGH && now - debounce[2] >= 150) {
           DEBUG_LOG("Key pressed (screen %d)", current_screen);
+          play_beep(800, 50);  // Short beep for button feedback
           if (current_screen == SCREEN_MAIN_MENU) {
               DEBUG_LOG("Main menu select: %d", main_menu_selection);
               switch (main_menu_selection) {
@@ -370,13 +392,16 @@ void load_preferences() {
     sound_enabled    = preferences.getBool("sound",   true);
     sound_volume     = preferences.getInt ("volume",  70);
     alerts_enabled   = preferences.getBool("alerts",  true);
-    low_temp_threshold  = preferences.getFloat("low", 10.0f);
-    high_temp_threshold = preferences.getFloat("high",40.0f);
+    alert_temp_threshold = preferences.getFloat("alert_temp", 600.0f);
     debug_logging    = preferences.getBool("debug",   false);
+    battery_alerts_enabled = preferences.getBool("batt_alerts", true);
+    battery_low_threshold = preferences.getInt("batt_low", 20);
+    battery_critical_threshold = preferences.getInt("batt_crit", 10);
     preferences.end();
-    DEBUG_LOG("Preferences loaded - Units:%s Bright:%d Sound:%s Vol:%d Alerts:%s Debug:%s",
+    DEBUG_LOG("Preferences loaded - Units:%s Bright:%d Sound:%s Vol:%d Alerts:%s AlertTemp:%.1f°F Debug:%s Batt:%s",
               use_celsius ? "C" : "F", brightness_level, sound_enabled ? "ON" : "OFF",
-              sound_volume, alerts_enabled ? "ON" : "OFF", debug_logging ? "ON" : "OFF");
+              sound_volume, alerts_enabled ? "ON" : "OFF", alert_temp_threshold,
+              debug_logging ? "ON" : "OFF", battery_alerts_enabled ? "ON" : "OFF");
 }
 void save_preferences() {
     DEBUG_LOG("Saving preferences...");
@@ -386,13 +411,16 @@ void save_preferences() {
     preferences.putBool ("sound",   sound_enabled);
     preferences.putInt  ("volume",  sound_volume);
     preferences.putBool ("alerts",  alerts_enabled);
-    preferences.putFloat("low",     low_temp_threshold);
-    preferences.putFloat("high",    high_temp_threshold);
+    preferences.putFloat("alert_temp", alert_temp_threshold);
     preferences.putBool ("debug",   debug_logging);
+    preferences.putBool ("batt_alerts", battery_alerts_enabled);
+    preferences.putInt  ("batt_low", battery_low_threshold);
+    preferences.putInt  ("batt_crit", battery_critical_threshold);
     preferences.end();
-    DEBUG_LOG("Preferences saved - Units:%s Bright:%d Sound:%s Vol:%d Alerts:%s Debug:%s",
+    DEBUG_LOG("Preferences saved - Units:%s Bright:%d Sound:%s Vol:%d Alerts:%s AlertTemp:%.1f°F Debug:%s Batt:%s",
               use_celsius ? "C" : "F", brightness_level, sound_enabled ? "ON" : "OFF",
-              sound_volume, alerts_enabled ? "ON" : "OFF", debug_logging ? "ON" : "OFF");
+              sound_volume, alerts_enabled ? "ON" : "OFF", alert_temp_threshold,
+              debug_logging ? "ON" : "OFF", battery_alerts_enabled ? "ON" : "OFF");
 }
 
 /* ============================================================= */
@@ -451,6 +479,40 @@ void create_main_menu_ui() {
   lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
   lv_obj_set_style_text_color(sub, lv_color_hex(0xE0E0E0), 0);
   lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 45);
+
+  /* Battery indicator */
+  lv_obj_t *batt_cont = lv_obj_create(main_menu_screen);
+  lv_obj_set_size(batt_cont, 80, 25);
+  lv_obj_align(batt_cont, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+  lv_obj_set_style_bg_color(batt_cont, lv_color_hex(0x2c3e50), 0);
+  lv_obj_set_style_border_width(batt_cont, 1, 0);
+  lv_obj_set_style_border_color(batt_cont, lv_color_hex(0xFF6B35), 0);
+  lv_obj_set_style_radius(batt_cont, 3, 0);
+
+  /* Battery icon (simple rectangle with fill) */
+  lv_obj_t *batt_icon = lv_obj_create(batt_cont);
+  lv_obj_set_size(batt_icon, 12, 6);
+  lv_obj_align(batt_icon, LV_ALIGN_LEFT_MID, 3, 0);
+  lv_obj_set_style_bg_color(batt_icon, lv_color_hex(0x666666), 0);
+  lv_obj_set_style_border_width(batt_icon, 1, 0);
+  lv_obj_set_style_border_color(batt_icon, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_radius(batt_icon, 1, 0);
+
+  /* Battery fill level */
+  lv_obj_t *batt_fill = lv_obj_create(batt_icon);
+  lv_obj_set_size(batt_fill, 8, 4);
+  lv_obj_align(batt_fill, LV_ALIGN_LEFT_MID, 1, 0);
+  lv_obj_set_style_bg_color(batt_fill, get_battery_color(battery_level), 0);
+  lv_obj_set_style_radius(batt_fill, 1, 0);
+
+  /* Battery percentage text */
+  lv_obj_t *batt_text = lv_label_create(batt_cont);
+  char batt_buf[8];
+  snprintf(batt_buf, sizeof(batt_buf), "%d%%", battery_level);
+  lv_label_set_text(batt_text, batt_buf);
+  lv_obj_set_style_text_font(batt_text, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(batt_text, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_align(batt_text, LV_ALIGN_LEFT_MID, 20, 0);
 
   /* buttons */
   int bw = 90, bh = 100, sp = 10, yoff = 25;
@@ -829,54 +891,52 @@ void switch_to_settings_screen() {
         lv_obj_set_style_bg_color(off, !alerts_enabled ? lv_color_hex(0xAA0000) : lv_color_hex(0x666666), LV_PART_MAIN);
         { lv_obj_t *l = lv_label_create(off); lv_label_set_text(l, "OFF"); lv_obj_center(l); }
 
-        /* Low slider */
-        lv_obj_t *lc = lv_obj_create(settings_screen);
-        lv_obj_set_size(lc, 280, 50);
-        lv_obj_align(lc, LV_ALIGN_CENTER, 0, 10);
-        lv_obj_set_style_bg_color(lc, lv_color_hex(0x2c3e50), 0);
-        lv_obj_set_style_border_width(lc, 2, 0);
-        lv_obj_set_style_border_color(lc, lv_color_hex(0x0099FF), 0);
-        lv_obj_set_style_radius(lc, 10, 0);
-        { lv_obj_t *t = lv_label_create(lc); lv_label_set_text(t, "Low Threshold (°C)"); lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 5); }
+        /* Alert Temperature slider */
+        lv_obj_t *ac = lv_obj_create(settings_screen);
+        lv_obj_set_size(ac, 280, 80);
+        lv_obj_align(ac, LV_ALIGN_CENTER, 0, 20);
+        lv_obj_set_style_bg_color(ac, lv_color_hex(0x2c3e50), 0);
+        lv_obj_set_style_border_width(ac, 2, 0);
+        lv_obj_set_style_border_color(ac, lv_color_hex(0xFF6B35), 0);
+        lv_obj_set_style_radius(ac, 10, 0);
 
-        lv_obj_t *ls = lv_slider_create(lc);
-        lv_obj_set_size(ls, 200, 10);
-        lv_obj_align(ls, LV_ALIGN_BOTTOM_MID, 0, -5);
-        lv_slider_set_range(ls, -20, 40);
-        lv_slider_set_value(ls, low_temp_threshold, LV_ANIM_OFF);
-        lv_obj_set_style_bg_color(ls, lv_color_hex(0x34495e), LV_PART_MAIN);
-        lv_obj_set_style_bg_color(ls, lv_color_hex(0x0099FF), LV_PART_INDICATOR);
-        lv_obj_add_event_cb(ls, temp_alert_slider_event_cb, LV_EVENT_VALUE_CHANGED, (void*)0);
+        lv_obj_t *at = lv_label_create(ac);
+        lv_label_set_text(at, "Alert Temperature (°F)");
+        lv_obj_align(at, LV_ALIGN_TOP_MID, 0, 8);
+
+        lv_obj_t *as = lv_slider_create(ac);
+        lv_obj_set_size(as, 200, 20);
+        lv_obj_align(as, LV_ALIGN_CENTER, 0, 15);
+        lv_slider_set_range(as, 400, 700);  // 400°F to 700°F range
+        lv_slider_set_value(as, alert_temp_threshold, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(as, lv_color_hex(0x34495e), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(as, lv_color_hex(0xFF6B35), LV_PART_INDICATOR);
+        lv_obj_add_event_cb(as, temp_alert_slider_event_cb, LV_EVENT_VALUE_CHANGED, nullptr);
 
         char buf[16];
-        snprintf(buf, sizeof(buf), "%.1f", low_temp_threshold);
-        lv_obj_t *ll = lv_label_create(lc);
-        lv_label_set_text(ll, buf);
-        lv_obj_align(ll, LV_ALIGN_CENTER, 110, 0);
+        snprintf(buf, sizeof(buf), "%.0f°F", alert_temp_threshold);
+        lv_obj_t *al = lv_label_create(ac);
+        lv_label_set_text(al, buf);
+        lv_obj_align(al, LV_ALIGN_BOTTOM_MID, 0, -5);
 
-        /* High slider */
-        lv_obj_t *hc = lv_obj_create(settings_screen);
-        lv_obj_set_size(hc, 280, 50);
-        lv_obj_align(hc, LV_ALIGN_CENTER, 0, 70);
-        lv_obj_set_style_bg_color(hc, lv_color_hex(0x2c3e50), 0);
-        lv_obj_set_style_border_width(hc, 2, 0);
-        lv_obj_set_style_border_color(hc, lv_color_hex(0xFF6600), 0);
-        lv_obj_set_style_radius(hc, 10, 0);
-        { lv_obj_t *t = lv_label_create(hc); lv_label_set_text(t, "High Threshold (°C)"); lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 5); }
+        /* Up/Down buttons for fine adjustment */
+        lv_obj_t *up_btn = lv_btn_create(settings_screen);
+        lv_obj_set_size(up_btn, 80, 40);
+        lv_obj_align(up_btn, LV_ALIGN_CENTER, -60, 100);
+        lv_obj_set_style_bg_color(up_btn, lv_color_hex(0x34495e), LV_PART_MAIN);
+        lv_obj_set_style_border_width(up_btn, 2, LV_PART_MAIN);
+        lv_obj_set_style_border_color(up_btn, lv_color_hex(0xFF6B35), LV_PART_MAIN);
+        lv_obj_add_event_cb(up_btn, temp_alert_up_btn_event_cb, LV_EVENT_CLICKED, nullptr);
+        { lv_obj_t *l = lv_label_create(up_btn); lv_label_set_text(l, "+5°"); lv_obj_center(l); }
 
-        lv_obj_t *hs = lv_slider_create(hc);
-        lv_obj_set_size(hs, 200, 10);
-        lv_obj_align(hs, LV_ALIGN_BOTTOM_MID, 0, -5);
-        lv_slider_set_range(hs, 30, 100);
-        lv_slider_set_value(hs, high_temp_threshold, LV_ANIM_OFF);
-        lv_obj_set_style_bg_color(hs, lv_color_hex(0x34495e), LV_PART_MAIN);
-        lv_obj_set_style_bg_color(hs, lv_color_hex(0xFF6600), LV_PART_INDICATOR);
-        lv_obj_add_event_cb(hs, temp_alert_slider_event_cb, LV_EVENT_VALUE_CHANGED, (void*)1);
-
-        snprintf(buf, sizeof(buf), "%.1f", high_temp_threshold);
-        lv_obj_t *hl = lv_label_create(hc);
-        lv_label_set_text(hl, buf);
-        lv_obj_align(hl, LV_ALIGN_CENTER, 110, 0);
+        lv_obj_t *down_btn = lv_btn_create(settings_screen);
+        lv_obj_set_size(down_btn, 80, 40);
+        lv_obj_align(down_btn, LV_ALIGN_CENTER, 60, 100);
+        lv_obj_set_style_bg_color(down_btn, lv_color_hex(0x34495e), LV_PART_MAIN);
+        lv_obj_set_style_border_width(down_btn, 2, LV_PART_MAIN);
+        lv_obj_set_style_border_color(down_btn, lv_color_hex(0xFF6B35), LV_PART_MAIN);
+        lv_obj_add_event_cb(down_btn, temp_alert_down_btn_event_cb, LV_EVENT_CLICKED, nullptr);
+        { lv_obj_t *l = lv_label_create(down_btn); lv_label_set_text(l, "-5°"); lv_obj_center(l); }
 
         lv_obj_t *inst = lv_label_create(settings_screen);
         lv_label_set_text(inst, "Btn1: ON   Btn2: OFF   Key: OK");
@@ -976,7 +1036,12 @@ void update_temperature_reading() {
     // Debug logging throttled to every 5 seconds when debug is on
     static uint32_t last_debug_log = 0;
     if (debug_logging && (millis() - last_debug_log >= 5000)) {
-        DEBUG_LOG("Temperature read - Object: %.1f°C, Ambient: %.1f°C", current_object_temp, current_ambient_temp);
+        // Log raw sensor readings
+        float obj_f = use_celsius ? current_object_temp : (current_object_temp * 9.0f/5.0f + 32.0f);
+        float amb_f = use_celsius ? current_ambient_temp : (current_ambient_temp * 9.0f/5.0f + 32.0f);
+        DEBUG_LOG("Sensor RAW - Object: %.2f°C (%.2f°%c), Ambient: %.2f°C (%.2f°%c)", 
+                  current_object_temp, obj_f, use_celsius?'C':'F',
+                  current_ambient_temp, amb_f, use_celsius?'C':'F');
         last_debug_log = millis();
     }
 
@@ -1015,6 +1080,17 @@ void update_temp_display_screen() {
 
         if (amb_delta > big_step_amb) s_amb = amb;
         else s_amb = s_amb + ( (amb_delta > 1.0f ? alpha_fast : alpha_slow) * (amb - s_amb) );
+    }
+
+    // Debug logging: show raw vs displayed values (throttled to every 5 seconds)
+    static uint32_t last_display_debug_log = 0;
+    if (debug_logging && (millis() - last_display_debug_log >= 5000)) {
+        float raw_obj = use_celsius ? current_object_temp : (current_object_temp * 9.0f/5.0f + 32.0f);
+        float raw_amb = use_celsius ? current_ambient_temp : (current_ambient_temp * 9.0f/5.0f + 32.0f);
+        DEBUG_LOG("Display TEMP - Raw: %.2f°%c -> Displayed: %.2f°%c (smoothed) | Ambient Raw: %.2f°%c -> Displayed: %.2f°%c",
+                  raw_obj, use_celsius?'C':'F', s_obj, use_celsius?'C':'F',
+                  raw_amb, use_celsius?'C':'F', s_amb, use_celsius?'C':'F');
+        last_display_debug_log = millis();
     }
 
     /* Selective UI update: only update display if temperature changed by 1° or more */
@@ -1069,6 +1145,15 @@ void update_temp_gauge_screen() {
         gauge_init = true;
     }
 
+    // Debug logging: show raw vs displayed values (throttled to every 5 seconds)
+    static uint32_t last_gauge_debug_log = 0;
+    if (debug_logging && (millis() - last_gauge_debug_log >= 5000)) {
+        float raw_obj = use_celsius ? current_object_temp : (current_object_temp * 9.0f/5.0f + 32.0f);
+        DEBUG_LOG("Display GAUGE - Raw: %.2f°%c -> Displayed: %.2f°%c (smoothed)",
+                  raw_obj, use_celsius?'C':'F', smooth, use_celsius?'C':'F');
+        last_gauge_debug_log = millis();
+    }
+
     float temp_change = fabsf(smooth - last_displayed_temp);
     bool should_update_ui = (temp_change >= 1.0f);
 
@@ -1099,42 +1184,93 @@ void update_temp_gauge_screen() {
 }
 
 /* ============================================================= */
+/* ====================== BATTERY MONITORING ================== */
+/* ============================================================= */
+void update_battery_reading() {
+    uint32_t now = millis();
+    if (now - last_battery_update >= battery_update_interval) {
+        battery_voltage = M5.Power.getBatteryVoltage() / 1000.0f;  // Convert mV to V
+        battery_level = M5.Power.getBatteryLevel();  // Get percentage (0-100)
+
+        // Ensure battery level is within valid range
+        if (battery_level < 0) battery_level = 0;
+        if (battery_level > 100) battery_level = 100;
+
+        DEBUG_LOG("Battery update - Level: %d%%, Voltage: %.2fV", battery_level, battery_voltage);
+        last_battery_update = now;
+
+        // Check battery alerts
+        check_battery_alerts();
+    }
+}
+
+void check_battery_alerts() {
+    if (!battery_alerts_enabled) return;
+
+    static bool low_alert_triggered = false;
+    static bool critical_alert_triggered = false;
+
+    // Low battery alert (20%)
+    if (battery_level <= battery_low_threshold && !low_alert_triggered) {
+        DEBUG_LOG("Low battery alert: %d%% <= %d%%", battery_level, battery_low_threshold);
+        play_beep(600, 200); delay(150); play_beep(600, 200);
+        low_alert_triggered = true;
+    } else if (battery_level > battery_low_threshold + 5) {  // Reset with hysteresis
+        low_alert_triggered = false;
+    }
+
+    // Critical battery alert (10%)
+    if (battery_level <= battery_critical_threshold && !critical_alert_triggered) {
+        DEBUG_LOG("Critical battery alert: %d%% <= %d%%", battery_level, battery_critical_threshold);
+        play_beep(400, 500); delay(200); play_beep(400, 500); delay(200); play_beep(400, 500);
+        critical_alert_triggered = true;
+        // Dim display to conserve power
+        M5.Display.setBrightness(32);  // Very dim
+    } else if (battery_level > battery_critical_threshold + 5) {  // Reset with hysteresis
+        if (critical_alert_triggered) {
+            // Restore normal brightness
+            M5.Display.setBrightness(brightness_level);
+            DEBUG_LOG("Battery recovered, restoring brightness");
+        }
+        critical_alert_triggered = false;
+    }
+}
+
+/* ============================================================= */
 /* ====================== ALERTS ============================= */
 /* ============================================================= */
 void check_temp_alerts() {
     if (!alerts_enabled) return;
 
-    DEBUG_LOG("Checking alerts - Temp: %.1f°C, Low: %.1f°C, High: %.1f°C",
-              current_object_temp, low_temp_threshold, high_temp_threshold);
+    // Convert alert threshold to Celsius for comparison
+    float alert_threshold_c = use_celsius ? alert_temp_threshold : ((alert_temp_threshold - 32.0f) * 5.0f/9.0f);
 
-    static bool low_trig = false, high_trig = false;
+    DEBUG_LOG("Checking alerts - Temp: %.1f°C, Alert Threshold: %.1f°C (%.1f°F)",
+              current_object_temp, alert_threshold_c, alert_temp_threshold);
 
-    if (current_object_temp <= low_temp_threshold && !low_trig) {
-        DEBUG_LOG("Low temperature alert triggered: %.1f°C <= %.1f°C", current_object_temp, low_temp_threshold);
-        play_beep(800, 300); delay(100); play_beep(800, 300);
-        low_trig = true; digitalWrite(LED_PIN, HIGH);
-    } else if (current_object_temp > low_temp_threshold + 2.0f) {
-        if (low_trig) DEBUG_LOG("Low temperature alert reset: %.1f°C > %.1f°C",
-                               current_object_temp, low_temp_threshold + 2.0f);
-        low_trig = false; digitalWrite(LED_PIN, LOW);
-    }
+    static bool alert_trig = false;
 
-    if (current_object_temp >= high_temp_threshold && !high_trig) {
-        DEBUG_LOG("High temperature alert triggered: %.1f°C >= %.1f°C", current_object_temp, high_temp_threshold);
+    if (current_object_temp >= alert_threshold_c && !alert_trig) {
+        DEBUG_LOG("Temperature alert triggered: %.1f°C >= %.1f°C", current_object_temp, alert_threshold_c);
         play_beep(1200, 500); delay(100); play_beep(1200, 500);
-        high_trig = true; digitalWrite(LED_PIN, HIGH);
-    } else if (current_object_temp < high_temp_threshold - 2.0f) {
-        if (high_trig) DEBUG_LOG("High temperature alert reset: %.1f°C < %.1f°C",
-                                current_object_temp, high_temp_threshold - 2.0f);
-        high_trig = false; digitalWrite(LED_PIN, LOW);
+        alert_trig = true; digitalWrite(LED_PIN, HIGH);
+    } else if (current_object_temp < alert_threshold_c - 2.0f) {
+        if (alert_trig) DEBUG_LOG("Temperature alert reset: %.1f°C < %.1f°C",
+                                 current_object_temp, alert_threshold_c - 2.0f);
+        alert_trig = false; digitalWrite(LED_PIN, LOW);
     }
 }
 
 /* ============================================================= */
 /* ====================== UTILS =============================== */
 /* ============================================================= */
-void play_beep(int f, int d) {
-    if (sound_enabled) M5.Speaker.tone(f, d, 0, true);
+void play_beep(int frequency, int duration) {
+    if (sound_enabled) {
+        // Convert percentage to M5Stack volume range (64-255)
+        uint8_t m5_volume = map(sound_volume, 25, 100, VOLUME_MIN, VOLUME_MAX);
+        M5.Speaker.setVolume(m5_volume);
+        M5.Speaker.tone(frequency, duration);
+    }
 }
 
 lv_color_t get_temperature_color(float tF) {
@@ -1142,6 +1278,13 @@ lv_color_t get_temperature_color(float tF) {
     if (tF <= 560) return lv_color_hex(0xFFA500);
     if (tF <= 620) return lv_color_hex(0x00FF00);
     return lv_color_hex(0xFF4500);
+}
+
+lv_color_t get_battery_color(int level) {
+    if (level <= 10) return lv_color_hex(0xFF0000);  // Red - critical
+    if (level <= 20) return lv_color_hex(0xFFA500);  // Orange - low
+    if (level <= 50) return lv_color_hex(0xFFFF00);  // Yellow - medium
+    return lv_color_hex(0x00FF00);                   // Green - good
 }
 
 /* ============================================================= */
@@ -1171,12 +1314,29 @@ void volume_slider_event_cb(lv_event_t *e) {
 }
 void temp_alert_slider_event_cb(lv_event_t *e) {
     lv_obj_t *slider = lv_event_get_target_obj(e);
-    int high = (int)(intptr_t)lv_event_get_user_data(e);
-    if (high) high_temp_threshold = lv_slider_get_value(slider);
-    else      low_temp_threshold  = lv_slider_get_value(slider);
+    alert_temp_threshold = lv_slider_get_value(slider);
     alerts_changed_by_user = true;  // Mark that user changed alerts
     check_temp_alerts();  // Check immediately when user changes alerts
     save_preferences();
+    switch_to_settings_screen();  // Refresh the UI to show updated value
+}
+void temp_alert_up_btn_event_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        alert_temp_threshold = min(alert_temp_threshold + 5.0f, 700.0f);
+        alerts_changed_by_user = true;
+        check_temp_alerts();
+        save_preferences();
+        switch_to_settings_screen();  // Refresh the screen to show updated value
+    }
+}
+void temp_alert_down_btn_event_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        alert_temp_threshold = max(alert_temp_threshold - 5.0f, 400.0f);
+        alerts_changed_by_user = true;
+        check_temp_alerts();
+        save_preferences();
+        switch_to_settings_screen();  // Refresh the screen to show updated value
+    }
 }
 /* ============================================================= */
 /* ================ MAIN MENU HIGHLIGHT UPDATE ================= */
