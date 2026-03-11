@@ -1,12 +1,23 @@
 #include <Arduino.h>
 #include <M5Unified.h>
+#include <M5UnitUnified.h>
+#include <M5UnitUnifiedHUB.h>
 #include <Wire.h>
 #include <Adafruit_MLX90614.h>
 #include <lvgl.h>
+#include <m5_unit_joystick2.hpp>
+#include <M5_UNIT_8SERVO.h>
 #include "lv_conf.h"
 #include "m5gfx_lvgl.hpp"
 #include <Preferences.h>
 #include <math.h>                     // for M_PI
+
+#ifdef FIRMWARE_VERSION_REG
+#undef FIRMWARE_VERSION_REG
+#endif
+#ifdef I2C_ADDRESS_REG
+#undef I2C_ADDRESS_REG
+#endif
 
 /* ------------------- Debug logging system ------------------- */
 #define DEBUG_LOG(fmt, ...) if (debug_logging) Serial.printf("[DEBUG] " fmt "\n", ##__VA_ARGS__)
@@ -34,6 +45,7 @@ enum ScreenState {
     SCREEN_MAIN_MENU,
     SCREEN_TEMP_DISPLAY,
     SCREEN_TEMP_GAUGE,
+    SCREEN_SERVO,
     SCREEN_SETTINGS
 };
 
@@ -43,6 +55,7 @@ enum SettingsScreen {
     SETTINGS_AUDIO,
     SETTINGS_DISPLAY,
     SETTINGS_ALERTS,
+    SETTINGS_EMISSIVITY,
     SETTINGS_DEBUG,
     SETTINGS_EXIT
 };
@@ -57,8 +70,40 @@ bool use_celsius      = true;
 int  update_rate      = 150;      // ms (faster updates for responsive readings)
 bool debug_logging    = false;    // Enable/disable debug logging
 bool alerts_changed_by_user = false;  // Track if user manually changed alerts
-int main_menu_selection = 0;           // 0 = Thermometer, 1 = Gauge, 2 = Settings
+int main_menu_selection = 0;           // 0 = Thermometer, 1 = Gauge, 2 = Servo, 3 = Settings
 uint32_t last_main_menu_button_time[3] = {0, 0, 0};  // debounce
+float sensor_emissivity = 1.0f;        // Current MLX90614 emissivity
+float pending_emissivity = 1.0f;       // Editable emissivity value
+
+/* ------------------- Pa.HUB / I2C routing ------------------- */
+constexpr uint8_t PAHUB_I2C_ADDRESS      = 0x70;
+constexpr uint8_t MLX90614_I2C_ADDRESS   = 0x5A;
+constexpr uint8_t DEFAULT_NCIR_HUB_CHANNEL     = 5;
+constexpr uint8_t DEFAULT_JOYSTICK_HUB_CHANNEL = 1;
+constexpr uint8_t DEFAULT_SERVO_HUB_CHANNEL    = 2;
+constexpr uint8_t PAHUB_MAX_CHANNELS           = 6;
+constexpr uint8_t SERVO_OUTPUT_INDEX     = 0;
+constexpr uint8_t SERVO_UNIT_I2C_ADDRESS = M5_UNIT_8SERVO_DEFAULT_ADDR;
+constexpr uint8_t JOYSTICK_I2C_ADDRESS   = JOYSTICK2_ADDR;
+constexpr uint32_t PORTA_I2C_FREQUENCY   = 400000U;
+constexpr uint32_t SERVO_UPDATE_INTERVAL = 25;
+
+m5::unit::UnitUnified Units;
+m5::unit::UnitPaHub2 paHub{PAHUB_I2C_ADDRESS};
+M5UnitJoystick2 joystick2;
+M5_UNIT_8SERVO servoUnit;
+int port_a_sda = -1;
+int port_a_scl = -1;
+bool hub_available = false;
+uint8_t pahub_current_channel = 0xFF;
+uint8_t ncir_hub_channel = DEFAULT_NCIR_HUB_CHANNEL;
+uint8_t joystick_hub_channel = DEFAULT_JOYSTICK_HUB_CHANNEL;
+uint8_t servo_hub_channel = DEFAULT_SERVO_HUB_CHANNEL;
+bool joystick_available = false;
+bool servo_unit_available = false;
+int current_servo_command = 90;
+int last_servo_displayed_command = -1000;
+uint32_t last_servo_update = 0;
 
 /* ------------------- Battery monitoring ------------------- */
 int  battery_level     = 100;     // 0-100 percentage
@@ -81,11 +126,13 @@ Preferences preferences;
 lv_obj_t *main_menu_screen;
 lv_obj_t *temp_display_screen;
 lv_obj_t *temp_gauge_screen;
+lv_obj_t *servo_screen;
 lv_obj_t *settings_screen;
 
 /* ---- Main menu ---- */
 lv_obj_t *temp_display_btn;
 lv_obj_t *temp_gauge_btn;
+lv_obj_t *servo_menu_btn;
 lv_obj_t *settings_menu_btn;
 
 /* ---- Temp display ---- */
@@ -102,6 +149,12 @@ lv_obj_t *temp_gauge_needle;
 lv_obj_t *temp_gauge_value_label;
 lv_obj_t *temp_gauge_back_btn;
 
+/* ---- Servo ---- */
+lv_obj_t *servo_angle_label;
+lv_obj_t *servo_bar;
+lv_obj_t *servo_status_label;
+lv_obj_t *servo_back_btn;
+
 /* ------------------- Runtime state ------------------- */
 ScreenState current_screen = SCREEN_MAIN_MENU;
 SettingsScreen current_settings_screen = SETTINGS_MENU;
@@ -117,12 +170,14 @@ void switch_to_screen(ScreenState s);
 void create_main_menu_ui();
 void create_temp_display_ui();
 void create_temp_gauge_ui();
+void create_servo_ui();
 void create_settings_ui();
 void switch_to_settings_screen();
 void update_scale_config();
 void update_temperature_reading();
 void update_temp_display_screen();
 void update_temp_gauge_screen();
+void update_servo_screen();
 void update_battery_reading();
 void check_battery_alerts();
 void play_beep(int freq, int dur);
@@ -130,12 +185,22 @@ void check_temp_alerts();
 lv_color_t get_temperature_color(float tempF);
 lv_color_t get_battery_color(int level);
 void update_main_menu_highlight();
+void apply_emissivity_and_restart();
+bool select_hub_channel(uint8_t channel, const char* context);
+bool raw_select_hub_channel(uint8_t channel);
+bool i2c_device_present(uint8_t address);
+void log_i2c_scan_for_current_channel(const char* context);
+bool find_device_on_hub(uint8_t address, uint8_t& found_channel, const char* label);
+bool try_init_mlx_on_channel(uint8_t channel, bool log_scan);
+float readJoystickX();
+bool setServoSpeed(uint8_t channel, int value);
 
 
 /* ------------------- Event callbacks ------------------- */
 void main_menu_event_cb(lv_event_t *e);
 void temp_display_back_event_cb(lv_event_t *e);
 void temp_gauge_back_event_cb(lv_event_t *e);
+void servo_back_event_cb(lv_event_t *e);
 void brightness_slider_event_cb(lv_event_t *e);
 void volume_slider_event_cb(lv_event_t *e);
 void temp_alert_slider_event_cb(lv_event_t *e);
@@ -156,12 +221,85 @@ void setup() {
     M5.begin(cfg);
     Serial.println("M5Stack CoreS3 started");
 
+    port_a_sda = M5.getPin(m5::pin_name_t::port_a_sda);
+    port_a_scl = M5.getPin(m5::pin_name_t::port_a_scl);
+    Serial.printf("PortA I2C pins SDA=%d SCL=%d\n", port_a_sda, port_a_scl);
+    Wire.end();
+    Wire.begin(port_a_sda, port_a_scl, PORTA_I2C_FREQUENCY);
+
+    hub_available = i2c_device_present(PAHUB_I2C_ADDRESS);
+    if (hub_available) {
+        Serial.println("Pa.HUB detected on PortA");
+    } else {
+        Serial.println("Pa.HUB not detected, using direct PortA I2C");
+    }
+
     /* ---- Sensor ---- */
-    if (!mlx.begin()) {
+    bool mlx_ready = false;
+    if (hub_available) {
+        Serial.printf("Trying legacy NCIR startup on Pa.HUB channel %u\n", ncir_hub_channel);
+        mlx_ready = try_init_mlx_on_channel(ncir_hub_channel, false);
+
+        if (!mlx_ready) {
+            Serial.println("Legacy NCIR startup failed, scanning channels for fallback...");
+            for (uint8_t channel = 0; channel < PAHUB_MAX_CHANNELS && !mlx_ready; ++channel) {
+                if (channel == ncir_hub_channel) {
+                    continue;
+                }
+                if (try_init_mlx_on_channel(channel, true)) {
+                    ncir_hub_channel = channel;
+                    mlx_ready = true;
+                }
+            }
+        }
+    } else {
+        Serial.println("Trying direct PortA NCIR startup");
+        mlx_ready = try_init_mlx_on_channel(0, true);
+    }
+
+    if (!mlx_ready) {
         Serial.println("MLX90614 init failed!");
-        while (1);
+        while (1) {
+            delay(100);
+        }
     }
     Serial.println("MLX90614 OK");
+    sensor_emissivity = (float)mlx.readEmissivity();
+    if (isnan(sensor_emissivity) || sensor_emissivity < 0.1f || sensor_emissivity > 1.0f) {
+        sensor_emissivity = 1.0f;
+    }
+    pending_emissivity = sensor_emissivity;
+    Serial.printf("MLX90614 emissivity: %.2f\n", sensor_emissivity);
+
+    joystick_available = find_device_on_hub(JOYSTICK_I2C_ADDRESS, joystick_hub_channel, "Joystick2");
+    if (joystick_available) {
+        if (!select_hub_channel(joystick_hub_channel, "joystick init") ||
+            !joystick2.begin(&Wire, JOYSTICK_I2C_ADDRESS, port_a_sda, port_a_scl, PORTA_I2C_FREQUENCY)) {
+            joystick_available = false;
+            Serial.println("Joystick2 init failed, disabling servo input");
+        } else {
+            joystick2.set_rgb_color(0x00AAFF);
+            Serial.printf("Joystick2 OK on channel %u\n", joystick_hub_channel);
+        }
+    } else {
+        Serial.println("Joystick2 not found, servo input disabled");
+    }
+
+    servo_unit_available = find_device_on_hub(SERVO_UNIT_I2C_ADDRESS, servo_hub_channel, "8Servo Unit");
+    if (servo_unit_available) {
+        if (!select_hub_channel(servo_hub_channel, "8Servo init") ||
+            !servoUnit.begin(&Wire, port_a_sda, port_a_scl, SERVO_UNIT_I2C_ADDRESS)) {
+            servo_unit_available = false;
+            Serial.println("8Servo Unit init failed, disabling servo output");
+        } else {
+            servoUnit.setOnePinMode(SERVO_OUTPUT_INDEX, SERVO_CTL_MODE);
+            Serial.printf("8Servo Unit OK on channel %u\n", servo_hub_channel);
+            setServoSpeed(servo_hub_channel, current_servo_command);
+        }
+    } else {
+        Serial.println("8Servo Unit not found, servo output disabled");
+    }
+    select_hub_channel(ncir_hub_channel, "restore NCIR channel");
 
     /* ---- LVGL ---- */
     lv_init();
@@ -178,6 +316,7 @@ void setup() {
     create_main_menu_ui();
     create_temp_display_ui();
     create_temp_gauge_ui();
+    create_servo_ui();
     create_settings_ui();
 
     /* ---- Start on main menu ---- */
@@ -192,6 +331,9 @@ void setup() {
 /* ============================================================= */
 void loop() {
   M5.update();
+  if (hub_available) {
+      Units.update();
+  }
 
   /* ---- LVGL refresh ---- */
   uint32_t now = millis();
@@ -217,6 +359,17 @@ void loop() {
       last_update = millis();
   }
 
+  if (current_screen == SCREEN_SERVO && joystick_available && servo_unit_available &&
+      millis() - last_servo_update >= SERVO_UPDATE_INTERVAL) {
+      const float joystick_x = readJoystickX();
+      const int command = constrain(static_cast<int>(lroundf(90.0f + joystick_x * 90.0f)), 0, 180);
+      if (abs(command - current_servo_command) >= 1) {
+          setServoSpeed(servo_hub_channel, command);
+      }
+      update_servo_screen();
+      last_servo_update = millis();
+  }
+
   /* ---- Battery update ---- */
   update_battery_reading();
 
@@ -236,13 +389,13 @@ void loop() {
           DEBUG_LOG("Button 1 pressed (screen %d)", current_screen);
           play_beep(1000, 50);  // Short beep for button feedback
           if (current_screen == SCREEN_MAIN_MENU) {
-              main_menu_selection = (main_menu_selection - 1 + 3) % 3;
+              main_menu_selection = (main_menu_selection - 1 + 4) % 4;
               update_main_menu_highlight();
               DEBUG_LOG("Main menu selection: %d", main_menu_selection);
           } else if (current_screen == SCREEN_SETTINGS) {
               DEBUG_LOG("Settings screen: %d", current_settings_screen);
               if (current_settings_screen == SETTINGS_MENU) {
-                  current_settings_selection = (current_settings_selection + 1) % 6;
+                  current_settings_selection = (current_settings_selection + 1) % 7;
                   switch_to_settings_screen();
                   DEBUG_LOG("Settings nav: selection %d", current_settings_selection);
               } else if (current_settings_screen == SETTINGS_UNITS) {
@@ -262,6 +415,10 @@ void loop() {
                   save_preferences();
                   switch_to_settings_screen();
                   DEBUG_LOG("Alerts: Set to ON");
+              } else if (current_settings_screen == SETTINGS_EMISSIVITY) {
+                  pending_emissivity = min(pending_emissivity + 0.01f, 1.00f);
+                  switch_to_settings_screen();
+                  DEBUG_LOG("Emissivity increased to %.2f", pending_emissivity);
               } else if (current_settings_screen == SETTINGS_DEBUG) {
                   debug_logging = true;
                   save_preferences();
@@ -281,13 +438,13 @@ void loop() {
           DEBUG_LOG("Button 2 pressed (screen %d)", current_screen);
           play_beep(1200, 50);  // Short beep for button feedback
           if (current_screen == SCREEN_MAIN_MENU) {
-              main_menu_selection = (main_menu_selection + 1) % 3;
+              main_menu_selection = (main_menu_selection + 1) % 4;
               update_main_menu_highlight();
               DEBUG_LOG("Main menu selection: %d", main_menu_selection);
           } else if (current_screen == SCREEN_SETTINGS) {
               DEBUG_LOG("Settings screen: %d", current_settings_screen);
               if (current_settings_screen == SETTINGS_MENU) {
-                  current_settings_selection = (current_settings_selection - 1 + 6) % 6;
+                  current_settings_selection = (current_settings_selection - 1 + 7) % 7;
                   switch_to_settings_screen();
                   DEBUG_LOG("Settings nav: selection %d", current_settings_selection);
               } else if (current_settings_screen == SETTINGS_UNITS) {
@@ -307,6 +464,10 @@ void loop() {
                   save_preferences();
                   switch_to_settings_screen();
                   DEBUG_LOG("Alerts: Set to OFF");
+              } else if (current_settings_screen == SETTINGS_EMISSIVITY) {
+                  pending_emissivity = max(pending_emissivity - 0.01f, 0.10f);
+                  switch_to_settings_screen();
+                  DEBUG_LOG("Emissivity decreased to %.2f", pending_emissivity);
               } else if (current_settings_screen == SETTINGS_DEBUG) {
                   debug_logging = false;
                   save_preferences();
@@ -330,7 +491,8 @@ void loop() {
               switch (main_menu_selection) {
                   case 0: switch_to_screen(SCREEN_TEMP_DISPLAY); break;
                   case 1: switch_to_screen(SCREEN_TEMP_GAUGE);   break;
-                  case 2: switch_to_screen(SCREEN_SETTINGS);     break;
+                  case 2: switch_to_screen(SCREEN_SERVO);        break;
+                  case 3: switch_to_screen(SCREEN_SETTINGS);     break;
               }
           } else if (current_screen == SCREEN_SETTINGS) {
               DEBUG_LOG("Settings screen: %d, selection: %d", current_settings_screen, current_settings_selection);
@@ -340,10 +502,16 @@ void loop() {
                       case 1: current_settings_screen = SETTINGS_AUDIO;   break;
                       case 2: current_settings_screen = SETTINGS_DISPLAY; break;
                       case 3: current_settings_screen = SETTINGS_ALERTS;  break;
-                      case 4: current_settings_screen = SETTINGS_DEBUG;   break;
-                      case 5: current_settings_screen = SETTINGS_EXIT;    break;
+                      case 4: current_settings_screen = SETTINGS_EMISSIVITY; break;
+                      case 5: current_settings_screen = SETTINGS_DEBUG;   break;
+                      case 6: current_settings_screen = SETTINGS_EXIT;    break;
+                  }
+                  if (current_settings_screen == SETTINGS_EMISSIVITY) {
+                      pending_emissivity = sensor_emissivity;
                   }
                   switch_to_settings_screen();
+              } else if (current_settings_screen == SETTINGS_EMISSIVITY) {
+                  apply_emissivity_and_restart();
               } else if (current_settings_screen == SETTINGS_EXIT) {
                   DEBUG_LOG("Exit: %s", exit_selection_cancel ? "CANCEL - back to menu" : "SAVE - back to menu");
                   if (exit_selection_cancel) {
@@ -416,10 +584,11 @@ void save_preferences() {
     preferences.putBool ("batt_alerts", battery_alerts_enabled);
     preferences.putInt  ("batt_low", battery_low_threshold);
     preferences.putInt  ("batt_crit", battery_critical_threshold);
+    preferences.putFloat("emissivity", sensor_emissivity);
     preferences.end();
-    DEBUG_LOG("Preferences saved - Units:%s Bright:%d Sound:%s Vol:%d Alerts:%s AlertTemp:%.1f°F Debug:%s Batt:%s",
+    DEBUG_LOG("Preferences saved - Units:%s Bright:%d Sound:%s Vol:%d Alerts:%s AlertTemp:%.1f°F Emiss:%.2f Debug:%s Batt:%s",
               use_celsius ? "C" : "F", brightness_level, sound_enabled ? "ON" : "OFF",
-              sound_volume, alerts_enabled ? "ON" : "OFF", alert_temp_threshold,
+              sound_volume, alerts_enabled ? "ON" : "OFF", alert_temp_threshold, sensor_emissivity,
               debug_logging ? "ON" : "OFF", battery_alerts_enabled ? "ON" : "OFF");
 }
 
@@ -429,7 +598,7 @@ void save_preferences() {
 void switch_to_screen(ScreenState s) {
     if (s == current_screen) return;
 
-    const char *screen_names[] = {"Main Menu", "Temp Display", "Temp Gauge", "Settings"};
+    const char *screen_names[] = {"Main Menu", "Temp Display", "Temp Gauge", "Servo", "Settings"};
     DEBUG_LOG("Screen transition: %s -> %s", screen_names[current_screen], screen_names[s]);
 
     current_screen = s;
@@ -441,6 +610,8 @@ void switch_to_screen(ScreenState s) {
         case SCREEN_TEMP_GAUGE:    lv_screen_load(temp_gauge_screen);
                                    update_scale_config();
                                    update_temp_gauge_screen();        break;
+        case SCREEN_SERVO:         lv_screen_load(servo_screen);
+                                   update_servo_screen();             break;
         case SCREEN_SETTINGS:      lv_screen_load(settings_screen);
                                    current_settings_screen = SETTINGS_MENU;  // Reset to main settings menu
                                    current_settings_selection = 0;           // Reset selection to first item
@@ -515,11 +686,11 @@ void create_main_menu_ui() {
   lv_obj_align(batt_text, LV_ALIGN_LEFT_MID, 20, 0);
 
   /* buttons */
-  int bw = 90, bh = 100, sp = 10, yoff = 25;
+  int bw = 130, bh = 58, xoff = 18, top_y = -5, bottom_y = 70;
 
   temp_display_btn = lv_btn_create(main_menu_screen);
   lv_obj_set_size(temp_display_btn, bw, bh);
-  lv_obj_align(temp_display_btn, LV_ALIGN_LEFT_MID, sp, yoff);
+  lv_obj_align(temp_display_btn, LV_ALIGN_CENTER, -xoff, top_y);
   lv_obj_set_style_bg_color(temp_display_btn, lv_color_hex(0x2c3e50), LV_PART_MAIN);
   lv_obj_set_style_bg_grad_color(temp_display_btn, lv_color_hex(0xFF6B35), LV_PART_MAIN);
   lv_obj_set_style_bg_grad_dir(temp_display_btn, LV_GRAD_DIR_VER, LV_PART_MAIN);
@@ -528,16 +699,25 @@ void create_main_menu_ui() {
 
   temp_gauge_btn = lv_btn_create(main_menu_screen);
   lv_obj_set_size(temp_gauge_btn, bw, bh);
-  lv_obj_align(temp_gauge_btn, LV_ALIGN_CENTER, 0, yoff);
+  lv_obj_align(temp_gauge_btn, LV_ALIGN_CENTER, xoff, top_y);
   lv_obj_set_style_bg_color(temp_gauge_btn, lv_color_hex(0x2c3e50), LV_PART_MAIN);
   lv_obj_set_style_bg_grad_color(temp_gauge_btn, lv_color_hex(0x4285F4), LV_PART_MAIN);
   lv_obj_set_style_bg_grad_dir(temp_gauge_btn, LV_GRAD_DIR_VER, LV_PART_MAIN);
   lv_obj_add_event_cb(temp_gauge_btn, main_menu_event_cb, LV_EVENT_CLICKED, (void*)SCREEN_TEMP_GAUGE);
   { lv_obj_t *l = lv_label_create(temp_gauge_btn); lv_label_set_text(l, "Gauge"); lv_obj_center(l); }
 
+  servo_menu_btn = lv_btn_create(main_menu_screen);
+  lv_obj_set_size(servo_menu_btn, bw, bh);
+  lv_obj_align(servo_menu_btn, LV_ALIGN_CENTER, -xoff, bottom_y);
+  lv_obj_set_style_bg_color(servo_menu_btn, lv_color_hex(0x2c3e50), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_color(servo_menu_btn, lv_color_hex(0x2ecc71), LV_PART_MAIN);
+  lv_obj_set_style_bg_grad_dir(servo_menu_btn, LV_GRAD_DIR_VER, LV_PART_MAIN);
+  lv_obj_add_event_cb(servo_menu_btn, main_menu_event_cb, LV_EVENT_CLICKED, (void*)SCREEN_SERVO);
+  { lv_obj_t *l = lv_label_create(servo_menu_btn); lv_label_set_text(l, "Servo"); lv_obj_center(l); }
+
   settings_menu_btn = lv_btn_create(main_menu_screen);
   lv_obj_set_size(settings_menu_btn, bw, bh);
-  lv_obj_align(settings_menu_btn, LV_ALIGN_RIGHT_MID, -sp, yoff);
+  lv_obj_align(settings_menu_btn, LV_ALIGN_CENTER, xoff, bottom_y);
   lv_obj_set_style_bg_color(settings_menu_btn, lv_color_hex(0x2c3e50), LV_PART_MAIN);
   lv_obj_set_style_bg_grad_color(settings_menu_btn, lv_color_hex(0x9b59b6), LV_PART_MAIN);
   lv_obj_set_style_bg_grad_dir(settings_menu_btn, LV_GRAD_DIR_VER, LV_PART_MAIN);
@@ -708,6 +888,54 @@ void create_temp_gauge_ui() {
 }
 
 /* ============================================================= */
+/* ====================== SERVO UI ============================ */
+/* ============================================================= */
+void create_servo_ui() {
+    servo_screen = lv_obj_create(nullptr);
+    lv_obj_set_style_bg_color(servo_screen, lv_color_hex(0x101820), 0);
+    lv_obj_remove_flag(servo_screen, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hdr = lv_obj_create(servo_screen);
+    lv_obj_set_size(hdr, 320, 60);
+    lv_obj_align(hdr, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(hdr, lv_color_hex(0x16324f), 0);
+
+    lv_obj_t *title = lv_label_create(hdr);
+    lv_label_set_text(title, "Servo Control");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(title);
+
+    servo_angle_label = lv_label_create(servo_screen);
+    lv_label_set_text(servo_angle_label, "STOPPED");
+    lv_obj_set_style_text_font(servo_angle_label, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(servo_angle_label, lv_color_hex(0x7DFFB3), 0);
+    lv_obj_align(servo_angle_label, LV_ALIGN_TOP_MID, 0, 78);
+
+    servo_bar = lv_bar_create(servo_screen);
+    lv_obj_set_size(servo_bar, 250, 22);
+    lv_obj_align(servo_bar, LV_ALIGN_CENTER, 0, 8);
+    lv_bar_set_range(servo_bar, 0, 180);
+    lv_bar_set_value(servo_bar, current_servo_command, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(servo_bar, lv_color_hex(0x273746), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(servo_bar, lv_color_hex(0x2ecc71), LV_PART_INDICATOR);
+
+    servo_status_label = lv_label_create(servo_screen);
+    lv_label_set_text(servo_status_label, "90 stop, <90 CCW, >90 CW");
+    lv_obj_set_style_text_color(servo_status_label, lv_color_hex(0xD0D8E0), 0);
+    lv_obj_align(servo_status_label, LV_ALIGN_CENTER, 0, 45);
+
+    servo_back_btn = lv_btn_create(servo_screen);
+    lv_obj_set_size(servo_back_btn, 90, 45);
+    lv_obj_align(servo_back_btn, LV_ALIGN_BOTTOM_LEFT, 15, -15);
+    lv_obj_set_style_bg_color(servo_back_btn, lv_color_hex(0x34495e), LV_PART_MAIN);
+    lv_obj_set_style_border_width(servo_back_btn, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(servo_back_btn, lv_color_hex(0x2ecc71), LV_PART_MAIN);
+    lv_obj_add_event_cb(servo_back_btn, servo_back_event_cb, LV_EVENT_CLICKED, nullptr);
+    { lv_obj_t *l = lv_label_create(servo_back_btn); lv_label_set_text(l, "Back"); lv_obj_center(l); }
+}
+
+/* ============================================================= */
 /* ===================== SETTINGS UI ========================= */
 /* ============================================================= */
 void create_settings_ui() {
@@ -739,14 +967,25 @@ void switch_to_settings_screen() {
     /* ---------- MENU ---------- */
     if (current_settings_screen == SETTINGS_MENU) {
         lv_label_set_text(title, "Configuration");
-        const char *items[] = {"Units","Audio","Display","Alerts","Debug","Exit"};
-        for (int i = 0; i < 6; ++i) {
+        const char *items[] = {"Units","Audio","Display","Alerts","Emiss","Debug","Exit"};
+        for (int i = 0; i < 7; ++i) {
             lv_obj_t *b = lv_btn_create(settings_screen);
             lv_obj_set_size(b, 90, 50);
-            int row = i / 3, col = i % 3;
-            lv_obj_align(b, LV_ALIGN_CENTER,
-                         (col==0?-100:(col==1?0:100)),
-                         (row==0?-35:(row==1?35:95)));
+            int x = 0;
+            int y = 0;
+            if (i < 3) {
+                int col = i;
+                x = (col == 0 ? -100 : (col == 1 ? 0 : 100));
+                y = -60;
+            } else if (i < 6) {
+                int col = i - 3;
+                x = (col == 0 ? -100 : (col == 1 ? 0 : 100));
+                y = 5;
+            } else {
+                x = 0;
+                y = 70;
+            }
+            lv_obj_align(b, LV_ALIGN_CENTER, x, y);
             lv_obj_set_style_bg_color(b, lv_color_hex(0x34495e), LV_PART_MAIN);
             lv_obj_set_style_border_width(b, 2, LV_PART_MAIN);
             lv_obj_set_style_border_color(b, lv_color_hex(0xFF6B35), LV_PART_MAIN);
@@ -944,6 +1183,45 @@ void switch_to_settings_screen() {
         return;
     }
 
+    /* ---------- EMISSIVITY ---------- */
+    if (current_settings_screen == SETTINGS_EMISSIVITY) {
+        lv_label_set_text(title, "Sensor Emissivity");
+
+        lv_obj_t *card = lv_obj_create(settings_screen);
+        lv_obj_set_size(card, 280, 125);
+        lv_obj_align(card, LV_ALIGN_CENTER, 0, -10);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x2c3e50), 0);
+        lv_obj_set_style_border_width(card, 2, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(0xFF6B35), 0);
+        lv_obj_set_style_radius(card, 10, 0);
+
+        char buf[64];
+        lv_obj_t *cur = lv_label_create(card);
+        snprintf(buf, sizeof(buf), "Current: %.2f", sensor_emissivity);
+        lv_label_set_text(cur, buf);
+        lv_obj_align(cur, LV_ALIGN_TOP_MID, 0, 10);
+
+        lv_obj_t *val = lv_label_create(card);
+        snprintf(buf, sizeof(buf), "New: %.2f", pending_emissivity);
+        lv_obj_set_style_text_font(val, &lv_font_montserrat_24, 0);
+        lv_label_set_text(val, buf);
+        lv_obj_align(val, LV_ALIGN_CENTER, 0, -5);
+
+        lv_obj_t *hint = lv_label_create(card);
+        lv_label_set_text(hint, "Range 0.10 to 1.00");
+        lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -10);
+
+        lv_obj_t *warn = lv_label_create(settings_screen);
+        lv_label_set_text(warn, "Press Key to write emissivity\nand restart device.");
+        lv_obj_set_style_text_align(warn, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(warn, LV_ALIGN_CENTER, 0, 78);
+
+        lv_obj_t *inst = lv_label_create(settings_screen);
+        lv_label_set_text(inst, "Btn1: +0.01   Btn2: -0.01   Key: Apply");
+        lv_obj_align(inst, LV_ALIGN_BOTTOM_MID, 0, -20);
+        return;
+    }
+
     /* ---------- DEBUG ---------- */
     if (current_settings_screen == SETTINGS_DEBUG) {
         lv_label_set_text(title, "Debug Logging");
@@ -1030,7 +1308,9 @@ void update_scale_config() {
 /* ====================== SENSOR READ ========================= */
 /* ============================================================= */
 void update_temperature_reading() {
+    select_hub_channel(ncir_hub_channel, "object temperature read");
     current_object_temp   = mlx.readObjectTempC();
+    select_hub_channel(ncir_hub_channel, "ambient temperature read");
     current_ambient_temp  = mlx.readAmbientTempC();
 
     // Debug logging throttled to every 5 seconds when debug is on
@@ -1183,6 +1463,33 @@ void update_temp_gauge_screen() {
     }
 }
 
+void update_servo_screen() {
+    const int clamped = constrain(current_servo_command, 0, 180);
+    if (abs(clamped - last_servo_displayed_command) < 1) {
+        return;
+    }
+
+    last_servo_displayed_command = clamped;
+
+    char buf[32];
+    if (clamped == 90) {
+        snprintf(buf, sizeof(buf), "STOPPED");
+    } else if (clamped < 90) {
+        snprintf(buf, sizeof(buf), "CCW %d", 90 - clamped);
+    } else {
+        snprintf(buf, sizeof(buf), "CW %d", clamped - 90);
+    }
+    lv_label_set_text(servo_angle_label, buf);
+    lv_bar_set_value(servo_bar, clamped, LV_ANIM_OFF);
+
+    if (!joystick_available || !servo_unit_available) {
+        snprintf(buf, sizeof(buf), "Servo hardware unavailable");
+    } else {
+        snprintf(buf, sizeof(buf), "Hub %u  8Servo %u  Cmd %d", servo_hub_channel, SERVO_OUTPUT_INDEX, clamped);
+    }
+    lv_label_set_text(servo_status_label, buf);
+}
+
 /* ============================================================= */
 /* ====================== BATTERY MONITORING ================== */
 /* ============================================================= */
@@ -1273,6 +1580,30 @@ void play_beep(int frequency, int duration) {
     }
 }
 
+void apply_emissivity_and_restart() {
+    pending_emissivity = constrain(pending_emissivity, 0.10f, 1.00f);
+    DEBUG_LOG("Applying emissivity %.2f and restarting", pending_emissivity);
+
+    lv_obj_clean(settings_screen);
+    lv_obj_set_style_bg_color(settings_screen, lv_color_hex(0x1a1a40), 0);
+
+    lv_obj_t *msg = lv_label_create(settings_screen);
+    lv_label_set_text(msg, "Writing emissivity...\nRestarting device...");
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(msg);
+    lv_refr_now(nullptr);
+
+    select_hub_channel(ncir_hub_channel, "write emissivity");
+    mlx.writeEmissivity(pending_emissivity);
+    delay(50);
+    sensor_emissivity = pending_emissivity;
+    save_preferences();
+    Serial.printf("Emissivity written: %.2f. Restarting now.\n", sensor_emissivity);
+    delay(800);
+    ESP.restart();
+}
+
 lv_color_t get_temperature_color(float tF) {
     if (tF < 480) return lv_color_hex(0x87CEEB);
     if (tF <= 560) return lv_color_hex(0xFFA500);
@@ -1287,6 +1618,144 @@ lv_color_t get_battery_color(int level) {
     return lv_color_hex(0x00FF00);                   // Green - good
 }
 
+bool select_hub_channel(uint8_t channel, const char* context) {
+    if (!hub_available) {
+        return true;
+    }
+    if (raw_select_hub_channel(channel)) {
+        return true;
+    }
+    Serial.printf("Pa.HUB select failed for channel %u during %s\n", channel, context ? context : "operation");
+    return false;
+}
+
+bool raw_select_hub_channel(uint8_t channel) {
+    if (channel >= PAHUB_MAX_CHANNELS) {
+        return false;
+    }
+    if (pahub_current_channel == channel) {
+        return true;
+    }
+    Wire.beginTransmission(PAHUB_I2C_ADDRESS);
+    Wire.write(static_cast<uint8_t>(1U << channel));
+    if (Wire.endTransmission() == 0) {
+        pahub_current_channel = channel;
+        delayMicroseconds(500);
+        return true;
+    }
+    return false;
+}
+
+bool i2c_device_present(uint8_t address) {
+    Wire.beginTransmission(address);
+    return (Wire.endTransmission() == 0);
+}
+
+bool find_device_on_hub(uint8_t address, uint8_t& found_channel, const char* label) {
+    if (!hub_available) {
+        if (i2c_device_present(address)) {
+            found_channel = 0;
+            Serial.printf("%s detected directly on PortA at 0x%02X\n", label, address);
+            return true;
+        }
+        return false;
+    }
+
+    for (uint8_t channel = 0; channel < PAHUB_MAX_CHANNELS; ++channel) {
+        if (!select_hub_channel(channel, label)) {
+            continue;
+        }
+        delay(5);
+        if (i2c_device_present(address)) {
+            found_channel = channel;
+            Serial.printf("%s detected on Pa.HUB channel %u at 0x%02X\n", label, channel, address);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool try_init_mlx_on_channel(uint8_t channel, bool log_scan) {
+    if (hub_available) {
+        if (!select_hub_channel(channel, "MLX90614 init")) {
+            return false;
+        }
+        delay(5);
+        if (log_scan) {
+            char context[48];
+            snprintf(context, sizeof(context), "NCIR candidate channel %u", channel);
+            log_i2c_scan_for_current_channel(context);
+        }
+    } else if (log_scan) {
+        log_i2c_scan_for_current_channel("direct PortA before MLX init");
+    }
+
+    if (mlx.begin(MLX90614_I2C_ADDRESS, &Wire)) {
+        if (hub_available) {
+            Serial.printf("MLX90614 initialized on Pa.HUB channel %u\n", channel);
+        } else {
+            Serial.println("MLX90614 initialized directly on PortA");
+        }
+        return true;
+    }
+    return false;
+}
+
+void log_i2c_scan_for_current_channel(const char* context) {
+    Serial.printf("I2C scan for %s:", context ? context : "current channel");
+    bool found_any = false;
+    for (uint8_t address = 0x03; address < 0x78; ++address) {
+        if (i2c_device_present(address)) {
+            Serial.printf(" 0x%02X", address);
+            found_any = true;
+        }
+    }
+    if (!found_any) {
+        Serial.print(" none");
+    }
+    Serial.println();
+}
+
+float readJoystickX() {
+    if (!joystick_available || !select_hub_channel(joystick_hub_channel, "joystick read")) {
+        return 0.0f;
+    }
+
+    const float raw = static_cast<float>(joystick2.get_joy_adc_12bits_offset_value_x());
+    float normalized = raw / 2048.0f;
+    normalized = constrain(normalized, -1.0f, 1.0f);
+
+    constexpr float dead_zone = 0.08f;
+    if (fabsf(normalized) < dead_zone) {
+        return 0.0f;
+    }
+
+    if (normalized > 0.0f) {
+        normalized = (normalized - dead_zone) / (1.0f - dead_zone);
+    } else {
+        normalized = (normalized + dead_zone) / (1.0f - dead_zone);
+    }
+    return constrain(normalized, -1.0f, 1.0f);
+}
+
+bool setServoSpeed(uint8_t channel, int value) {
+    if (!servo_unit_available) {
+        return false;
+    }
+    const int clamped = constrain(value, 0, 180);
+    if (!select_hub_channel(channel, "servo write")) {
+        return false;
+    }
+
+    const bool ok = servoUnit.setServoAngle(SERVO_OUTPUT_INDEX, static_cast<uint8_t>(clamped));
+    if (ok) {
+        current_servo_command = clamped;
+    } else {
+        Serial.printf("Servo write failed on 8Servo output %u\n", SERVO_OUTPUT_INDEX);
+    }
+    return ok;
+}
+
 /* ============================================================= */
 /* ====================== EVENT HANDLERS ===================== */
 /* ============================================================= */
@@ -1298,6 +1767,9 @@ void temp_display_back_event_cb(lv_event_t *e) {
     if (lv_event_get_code(e) == LV_EVENT_CLICKED) switch_to_screen(SCREEN_MAIN_MENU);
 }
 void temp_gauge_back_event_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) switch_to_screen(SCREEN_MAIN_MENU);
+}
+void servo_back_event_cb(lv_event_t *e) {
     if (lv_event_get_code(e) == LV_EVENT_CLICKED) switch_to_screen(SCREEN_MAIN_MENU);
 }
 void brightness_slider_event_cb(lv_event_t *e) {
@@ -1344,9 +1816,11 @@ void temp_alert_down_btn_event_cb(lv_event_t *e) {
 void update_main_menu_highlight() {
   lv_obj_set_style_border_width(temp_display_btn,   main_menu_selection == 0 ? 4 : 0, LV_PART_MAIN);
   lv_obj_set_style_border_width(temp_gauge_btn,     main_menu_selection == 1 ? 4 : 0, LV_PART_MAIN);
-  lv_obj_set_style_border_width(settings_menu_btn,  main_menu_selection == 2 ? 4 : 0, LV_PART_MAIN);
+  lv_obj_set_style_border_width(servo_menu_btn,     main_menu_selection == 2 ? 4 : 0, LV_PART_MAIN);
+  lv_obj_set_style_border_width(settings_menu_btn,  main_menu_selection == 3 ? 4 : 0, LV_PART_MAIN);
 
   lv_obj_set_style_border_color(temp_display_btn,   lv_color_hex(0x00FF00), LV_PART_MAIN);
   lv_obj_set_style_border_color(temp_gauge_btn,     lv_color_hex(0x00FF00), LV_PART_MAIN);
+  lv_obj_set_style_border_color(servo_menu_btn,     lv_color_hex(0x00FF00), LV_PART_MAIN);
   lv_obj_set_style_border_color(settings_menu_btn,  lv_color_hex(0x00FF00), LV_PART_MAIN);
 }
