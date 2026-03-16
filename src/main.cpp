@@ -281,7 +281,7 @@ static void build_ui() {
   // Live
   lbl_live_object = lv_label_create(tab_live);
   lv_obj_set_style_text_font(lbl_live_object, &lv_font_montserrat_32, 0);
-  lv_obj_set_style_text_color(lbl_live_object, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_text_color(lbl_live_object, lv_color_hex(0x000000), 0);
   lv_obj_align(lbl_live_object, LV_ALIGN_TOP_LEFT, 8, 8);
   lv_label_set_text(lbl_live_object, "Object: -- F");
 
