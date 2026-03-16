@@ -2,163 +2,65 @@
 
 ## Core Architecture
 
-### **State-Driven UI Pattern**
-The application uses a screen state enumeration that drives all UI and navigation logic:
+### Tab-Driven UI Pattern
+The active firmware uses a single LVGL screen with a `lv_tabview` containing four tabs:
+- `Live`
+- `Stats`
+- `Settings`
+- `About`
 
-```cpp
-enum ScreenState {
-    SCREEN_MAIN_MENU,
-    SCREEN_TEMP_DISPLAY,
-    SCREEN_TEMP_GAUGE,
-    SCREEN_SETTINGS
-};
-```
+Navigation state is tracked with `current_tab`, and tab changes are performed through `goto_tab()`.
 
-Each state corresponds to a dedicated LVGL screen object loaded into the display buffer. State transitions are handled through the `switch_to_screen()` function which manages screen loading and initialization.
+### Polled Joystick Input Pattern
+The joystick is read by raw I2C register access instead of a higher-level device library. Input is polled on a timed interval and passed through a simple filter before being used for navigation.
 
-### **Interrupt-Driven Input Pattern**
-Hardware button inputs use ESP32 GPIO interrupts rather than polled buttons:
+Relevant pattern:
+- select Pa.HUB channel
+- read X register
+- read Y register
+- read button register
+- apply center offset and filtering
+- apply threshold and debounce/repeat rules
 
-```cpp
-// Global flag variables set by interrupts
-volatile bool button1_pressed = false;
-volatile bool button2_pressed = false;
-volatile bool key_pressed = false;
+### Pa.HUB Channel Selection Pattern
+Every device read begins by selecting the correct Pa.HUB channel through I2C address `0x70`. This is a critical integration pattern because both the joystick and MLX90614 share the same upstream bus.
 
-// ISR functions
-void IRAM_ATTR button1_ISR() { button1_pressed = true; }
-void IRAM_ATTR button2_ISR() { button2_pressed = true; }
-void IRAM_ATTR key_ISR() { key_pressed = true; }
-```
+### Timed Update Pattern
+The main loop is driven by separate intervals:
+- LVGL tick interval
+- joystick polling interval
+- temperature sampling interval
+- UI refresh interval
 
-This pattern ensures responsive input handling without blocking the main loop.
+This keeps UI work, input handling, and sensor reads separate and predictable.
 
-### **Settings Tab Enumeration Pattern**
-Settings tabs use a similar enumeration approach with looping navigation:
+## Data Patterns
 
-```cpp
-enum SettingsTab {
-    TAB_GENERAL,    // Temperature units
-    TAB_DISPLAY,    // Brightness (future)
-    TAB_SOUND,      // Audio settings
-    TAB_ALERTS,     // Temperature thresholds
-    TAB_ABOUT       // Device info
-};
+### Dual-Unit Temperature Storage
+The firmware stores readings in both Fahrenheit and Celsius after each successful sensor read. Fahrenheit is the base for zone classification and min/max tracking.
 
-// Button handlers cycle through tabs
-current_settings_tab = (SettingsTab)((current_settings_tab + 1) % 5);
-```
+### Derived Display Values
+UI labels use rounded whole-number display values derived from the latest floating-point readings. This keeps the display easier to read at a glance.
 
-## UI Component Patterns
+### Session Statistics
+The active session tracks:
+- minimum object temperature
+- maximum object temperature
+- last object temperature
+- successful read count
 
-### **Screen Creation Pattern**
-Each screen follows a consistent creation pattern:
+These values are in-memory only and reset on reboot.
 
-```cpp
-void create_[screen_name]_ui() {
-    [screen_name]_screen = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color([screen_name]_screen, lv_color_hex(0x[background_color]), 0);
-    
-    // Title and layout elements
-    // UI components assigned to global pointers
-    // Event callbacks attached
-}
-```
+## UI Update Pattern
+The UI is created once in `build_ui()` and updated repeatedly through `update_ui()`. LVGL object pointers are stored globally to avoid dynamic lookup or screen reconstruction during runtime.
 
-### **LVGL Object Management**
-UI objects are declared as global pointers and created once during setup:
+## Integration Constraints
+- No persistent settings layer yet
+- No interrupt-driven input handling
+- No background task separation
+- No dedicated hardware abstraction layer beyond helper functions in `main.cpp`
 
-```cpp
-// Global UI object pointers
-lv_obj_t *temp_display_screen;
-lv_obj_t *temp_display_back_btn;
-lv_obj_t *object_temp_label;
-// ... etc
-```
-
-This avoids dynamic memory allocation during runtime and ensures consistent object references.
-
-## Data Management Patterns
-
-### **Sensor Reading Pattern**
-Temperature readings use a timed update pattern to avoid overwhelming the sensor:
-
-```cpp
-void update_temperature_reading() {
-    current_object_temp = mlx.readObjectTempC();
-    current_ambient_temp = mlx.readAmbientTempC();
-    
-    static unsigned long last_debug = 0;
-    if (millis() - last_debug >= 5000) {
-        Serial.printf("Temps - Object: %.1f°C, Ambient: %.1f°C\n", 
-                     current_object_temp, current_ambient_temp);
-        last_debug = millis();
-    }
-}
-```
-
-### **Persistent Storage Pattern**
-Settings are managed through ESP32's Preferences library:
-
-```cpp
-// Load during setup
-preferences.begin("ncir_monitor", false);
-use_celsius = preferences.getBool("use_celsius", true);
-brightness_level = preferences.getInt("brightness", 128);
-// ... etc
-
-// Save when needed
-preferences.putBool("use_celsius", use_celsius);
-preferences.putInt("brightness", brightness_level);
-// ... etc
-```
-
-## Timing Patterns
-
-### **LVGL Refresh Timing**
-LVGL updates happen on a fixed interval to balance responsiveness and performance:
-
-```cpp
-const uint32_t screenTickPeriod = 10;
-uint32_t lastLvglTick = 0;
-
-// In main loop
-uint32_t current_time = millis();
-if (current_time - lastLvglTick >= screenTickPeriod) {
-    lvgl_tick_task(NULL);
-    lastLvglTick = current_time;
-}
-```
-
-### **Sensor Update Timing**
-Temperature sensor readings are throttled to reasonable refresh rates:
-
-```cpp
-int update_rate = 500; // milliseconds
-unsigned long last_update = 0;
-
-if (millis() - last_update >= update_rate) {
-    update_temperature_reading();
-    last_update = millis();
-}
-```
-
-## Alert System Patterns
-
-### **Hysteresis-Based Alerts**
-Temperature alerts use hysteresis to prevent rapid on/off cycling:
-
-```cpp
-if (current_object_temp <= low_temp_threshold && !low_alert_triggered) {
-    play_beep(800, 300);
-    low_alert_triggered = true;
-} else if (current_object_temp > low_temp_threshold + 2.0) {
-    low_alert_triggered = false; // Reset with 2°C hysteresis
-}
-```
-
-## Current Architecture Challenges
-- Screen state management becomes complex with settings navigation requirements
-- Hardware button semantics need redesign for different screen contexts
-- Visual highlighting system needs implementation
-- Exit confirmation flow needs integration with state management
+## Current Architecture Risks
+- Most logic is concentrated in one source file
+- The memory-bank previously described a different architecture and must not be reused as-is
+- Pa.HUB channel switching is a dependency for every successful peripheral read

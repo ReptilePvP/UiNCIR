@@ -1,72 +1,38 @@
-# Product Context: NCIR Monitor
+# Product Context: CoreS3 Temperature Dashboard
 
-## Problem Statement
-Users need a reliable, handheld device for non-contact temperature monitoring in various scenarios:
-- Cooking and food preparation (measuring surface temperatures without contact)
-- Industrial equipment monitoring (checking machinery temperatures safely)
-- Personal health monitoring (measuring body temperature from a distance)
-- HVAC system diagnostics (checking vent and duct temperatures)
+## Problem
+The device needs a simple on-device interface for non-contact temperature monitoring using the MLX90614. The display should be readable at a glance, and navigation should work from a physical joystick instead of touch.
 
-Current solutions are often:
-- Too expensive (professional IR thermometers)
-- Inaccurate for specific use cases
-- Lack proper user interface and alerts
-- Require constant attention and manual recording
+## Current Product Shape
+The project is currently a compact dashboard rather than a full workflow application. It is optimized for quick temperature checks and basic session stats, not for long configuration flows or extensive data storage.
 
-## Solution Overview
-The NCIR Monitor is a dedicated handheld device that provides:
-- **Accurate NCIR sensing** with MLX90614 sensor (-70°C to +380°C range)
-- **Real-time monitoring** with continuous display updates
-- **Multiple visualization modes** (digital display, analog gauge)
-- **Intelligent alerts** with customizable temperature thresholds
-- **Hardware-only navigation** for use in various environments (gloved hands, wet conditions, etc.)
-- **Persistent settings** and intuitive interface
+## Current User Experience Goals
+1. **Fast Readability**: Object temperature should be obvious immediately.
+2. **Simple Navigation**: Horizontal joystick movement should move between major views without confusion.
+3. **Minimal Friction**: Unit toggle and refresh tuning should be easy from a single settings page.
+4. **Stable Operation**: The hardware chain CoreS3 -> Pa.HUB -> Joystick2/MLX90614 should stay reliable during normal use.
 
-## User Experience Goals
-1. **Simple Operation**: Device works immediately after power-on with no complex setup
-2. **Clear Feedback**: Visual indicators and audio cues guide user interaction
-3. **Reliable Performance**: Consistent temperature readings regardless of environmental conditions
-4. **Intuitive Controls**: Hardware buttons map to logical functions throughout the device
-5. **Safety First**: Non-contact measurement prevents burns and contamination
+## Primary Usage Flow
+1. Power on device
+2. Land in the tabbed dashboard
+3. View live temperature on the Live tab
+4. Move to Stats for min/max and read count
+5. Move to Settings to change units or refresh speed
+6. Return to Live for continued monitoring
 
-## Key User Scenarios
+## Current Interaction Model
+- **Left/Right**: navigate tabs
+- **Up/Down**: adjust refresh rate on Settings
+- **Press**: toggle Fahrenheit/Celsius on Settings
 
-### **Chef Monitoring Food Temperatures**
-- Quickly check if cooking surfaces are at safe temperatures
-- Monitor multiple food items without touching contaminated surfaces
-- Receive alerts when temperatures exceed food safety thresholds
+## What The Product Is Not Yet
+- Not yet a persistent measurement logger
+- Not yet an alerting device
+- Not yet a servo-assisted automation tool
+- Not yet a touchscreen workflow
 
-### **Mechanic Checking Equipment**
-- Non-contact measurement of machinery components
-- Immediate alerts for equipment running too hot/cold
-- Visual gauge provides quick reference for normal operating ranges
-
-### **Field Service Technician**
-- Hands-free operation while carrying tools
-- Hardware buttons work with work gloves
-- Persistent settings maintain calibration between jobs
-
-## Design Principles
-
-### **Hardware-First Navigation**
-- **Main Menu**: Simple access to all primary functions
-- **Temperature Modes**: Dedicated screens for different viewing preferences
-- **Settings**: Comprehensive configuration without requiring menus
-- **No Touch Required**: All functions accessible via three hardware buttons
-
-### **Visual Design**
-- **Clean Interface**: Information presented clearly and concisely
-- **Consistent Layout**: Similar patterns across all screens
-- **Status Indicators**: Clear feedback about device state and alerts
-- **Accessible Colors**: High contrast for various lighting conditions
-
-### **Audio Design**
-- **Contextual Alerts**: Different tones for temperature thresholds, errors, and confirmations
-- **Configurable Volume**: Adjustable audio feedback levels
-- **Non-intrusive**: Alerts get attention without being disruptive
-
-## Success Metrics
-- **Usability**: Users can navigate all functions within 30 seconds of first use
-- **Accuracy**: Temperature readings within ±1°C of reference measurements
-- **Reliability**: Device operates for 8+ hours on single charge under normal use
-- **Safety**: Eliminates need for contact temperature measurement in hazardous scenarios
+## Design Priorities
+- Large temperature text
+- Clear zone status
+- Predictable control mapping
+- Low enough complexity to keep the firmware stable

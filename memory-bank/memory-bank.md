@@ -6,6 +6,11 @@ Last Updated: 2025-10-13
 
 # NCIR Monitor Memory Bank
 
+## Status Note
+This memory-bank folder is mostly historical. The active firmware in this repository is the joystick + Pa.HUB dashboard implemented in `src/main.cpp`, not the older button-driven NCIR monitor described in most files below.
+
+Use `memory-bank/current-firmware.md` as the current source of truth before relying on the older notes.
+
 This memory bank documents the NCIR Monitor project - an ESP32-based temperature monitoring device with MLX90614 sensor, LCD display, and hardware button interface.
 
 ## Core Requirements
