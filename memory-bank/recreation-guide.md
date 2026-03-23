@@ -42,7 +42,7 @@ Use the repository `platformio.ini` as the reference configuration. Important de
 5. Implement Pa.HUB channel selection on I2C address `0x70`.
 6. Implement raw Joystick2 register reads on address `0x63`.
 7. Initialize the MLX90614 on address `0x5A` after selecting channel `5`.
-8. Build a four-tab LVGL UI for Live, Stats, Settings, and About.
+8. Build a five-tab LVGL UI for Live, Stats, Settings, Alerts, and Calibration.
 9. Add a timed main loop for LVGL ticks, joystick polling, sensor reads, and UI refresh.
 
 ## Behavioral Notes

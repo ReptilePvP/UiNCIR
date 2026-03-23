@@ -1,9 +1,9 @@
 # Current Firmware Map
 
 ## Summary
-The active firmware is a joystick-driven LVGL dashboard for the M5Stack CoreS3. It reads an MLX90614 infrared temperature sensor through a Pa.HUB and renders a four-tab UI on the built-in display.
+The active firmware is a joystick-driven LVGL dashboard for the M5Stack CoreS3. It reads an MLX90614 infrared temperature sensor through a Pa.HUB and renders a five-tab UI on the built-in display.
 
-This document reflects the code currently compiled from `src/main.cpp`.
+Behavioral source of truth: `src/main.cpp`.
 
 ## Hardware Topology
 - **Core controller**: M5Stack CoreS3
@@ -14,27 +14,32 @@ This document reflects the code currently compiled from `src/main.cpp`.
 
 ## Runtime Flow
 ### Setup
-- Initializes `M5Unified`
+- Initializes `M5Unified` and enables external port power
 - Starts serial logging at `115200`
 - Starts I2C on the CoreS3 Port A pins
+- Loads persisted preferences from namespace `uiflow`
 - Initializes LVGL and creates a 320x240 display bridge
-- Builds a four-tab UI with `lv_tabview`
+- Builds a five-tab UI with `lv_tabview`
 - Selects the MLX channel and initializes the MLX90614
-- Performs an initial temperature read when the sensor is available
+- Reads current MLX emissivity and performs an initial temperature read when available
 
 ### Main Loop
 - Advances the LVGL tick every `5 ms`
 - Polls the joystick every `35 ms`
 - Polls the MLX90614 based on the selected refresh interval
-- Refreshes the visible labels and progress bar every `80 ms`
+- Handles threshold alert state and alert tones
+- Refreshes labels/sliders/indicators every `80 ms`
+- Executes delayed restart after emissivity write when required
 - Calls `lv_timer_handler()` continuously
 
 ## UI Structure
 ### Live tab
 - Large object temperature label
 - Ambient temperature label
-- Temperature bar
-- Temperature zone label
+- Emissivity display
+- Battery status label
+- Temperature bar and zone label
+- Optional alert visual background when threshold is reached
 
 ### Stats tab
 - Minimum object temperature seen
@@ -43,24 +48,31 @@ This document reflects the code currently compiled from `src/main.cpp`.
 - Successful read count
 
 ### Settings tab
-- Unit selection display (`F` or `C`)
-- Refresh interval display
-- Control hint text
+- Unit selection (`F` / `C`)
+- Refresh interval
+- Emissivity edit/apply flow (save + restart required)
+- Debug mode toggle
 
-### About tab
-- Short hardware and software summary
+### Alerts tab
+- Alerts enable/disable
+- Alert threshold edit/apply
+- Threshold slider and guidance text
+
+### Calibration tab
+- Calibration offset edit/apply
+- Offset slider and guidance text
 
 ## Input Model
-The project uses the Joystick2 over raw I2C reads rather than a joystick library wrapper.
+The project uses Joystick2 raw I2C reads (not a wrapper library).
 
 ### Horizontal movement
-- Left/right changes the active tab
+- Left/right changes the active tab when no edit mode is active
 
 ### Vertical movement
-- Up/down changes refresh speed only when the Settings tab is active
+- Up/down selects rows or adjusts values depending on active tab and edit mode
 
 ### Button press
-- Toggles Fahrenheit/Celsius only when the Settings tab is active
+- Press applies the selected action in Settings / Alerts / Calibration tabs
 
 ### Input filtering
 - Simple moving filter based on `JOY_FILTER_DIV`
@@ -68,39 +80,38 @@ The project uses the Joystick2 over raw I2C reads rather than a joystick library
 - Separate debounce/repeat timers for axis navigation and button press
 
 ## Temperature Model
-- Sensor reads are stored in both Fahrenheit and Celsius
-- Min/max tracking is kept in Fahrenheit and converted for display when needed
+- Sensor reads are stored in Fahrenheit and Celsius
+- Calibration offset is applied in Fahrenheit
+- Min/max tracking is kept in Fahrenheit and converted for display as needed
 - UI display values are rounded to whole numbers
-- Zone color and zone text are derived from the Fahrenheit object temperature
+- Zone color and zone text are derived from Fahrenheit object temperature
 
-### Fahrenheit zones
-- `< 350 F`: `LOW`
-- `350-449 F`: `READY`
-- `450-549 F`: `HOT`
-- `>= 550 F`: `TOO HOT`
+### Current zone bands
+- `< 500 F`: `COLD`
+- `500-610 F`: `GOOD`
+- `> 610 F`: `TOO HOT`
+
+## Persistence
+Stored in `Preferences` namespace `uiflow`:
+- Units (`use_f`)
+- Refresh index (`refresh_idx`)
+- Emissivity (`emissivity`)
+- Alerts enabled (`alerts_on`)
+- Alert threshold Fahrenheit (`alert_f`)
+- Calibration offset Fahrenheit (`cal_off_f`)
+- Debug enabled (`debug_on`)
 
 ## Important Constraints
-- No persistent settings storage yet
-- No servo logic in the active firmware path
-- No alert audio, LED logic, or battery management in the active firmware path
-- No touch interaction handling
+- Pa.HUB channel selection must happen before every downstream transaction
+- Servo logic is not in the active runtime flow
+- Emissivity writes trigger a delayed restart by design
+- Architecture is currently monolithic in `src/main.cpp`
 
 ## Files That Matter Right Now
 - `src/main.cpp`: active application logic
-- `README.md`: current high-level hardware and feature summary
+- `README.md`: high-level hardware and feature summary
 - `platformio.ini`: build target, libraries, and flags
 - `include/lv_conf.h`: LVGL configuration
 
-## Files That Appear To Be Legacy Or Experimental
-- `memory-bank/projectbrief.md`
-- `memory-bank/productContext.md`
-- `memory-bank/systemPatterns.md`
-- `memory-bank/techContext.md`
-- `memory-bank/activeContext.md`
-- `memory-bank/progress.md`
-- `memory-bank/recreation-guide.md`
-- `src/Old Work verison with temp.md`
-- `src/gauge_animation.h`
-- `include/gauge_animation.h`
-
-Those files describe a different button-driven NCIR monitor architecture or earlier experiments and should not be treated as the source of truth for current behavior.
+## Legacy Note
+Some memory-bank files describe older button-driven NCIR monitor concepts or earlier experiments. Use this file and `src/main.cpp` first when behavior conflicts.
